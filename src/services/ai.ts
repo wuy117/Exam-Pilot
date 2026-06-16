@@ -10,8 +10,27 @@ import type {
   TimetableSession,
 } from '../types';
 
+export type AIBackendStatus = 'idle' | 'real' | 'mock' | 'error';
+
 const id = (prefix: string) => `${prefix}-${crypto.randomUUID()}`;
 const today = () => new Date().toISOString().slice(0, 10);
+let latestStatus: AIBackendStatus = 'idle';
+const listeners = new Set<(status: AIBackendStatus) => void>();
+
+export const getAIBackendStatus = () => latestStatus;
+
+export const subscribeAIBackendStatus = (listener: (status: AIBackendStatus) => void) => {
+  listeners.add(listener);
+  listener(latestStatus);
+  return () => {
+    listeners.delete(listener);
+  };
+};
+
+const setAIBackendStatus = (status: AIBackendStatus) => {
+  latestStatus = status;
+  listeners.forEach((listener) => listener(status));
+};
 
 const apiBaseUrl = () => {
   const configured = import.meta.env.VITE_AI_API_BASE_URL;
@@ -59,6 +78,7 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
     const message = payload?.error || `AI backend returned ${response.status}.`;
     throw new Error(message);
   }
+  setAIBackendStatus('real');
   return payload as T;
 }
 
@@ -71,8 +91,10 @@ export const analyseGuidance = async (subject: Subject, content: string, data?: 
       });
     }
   } catch (error) {
+    setAIBackendStatus('error');
     console.warn('Falling back to mock guidance analysis:', error);
   }
+  setAIBackendStatus('mock');
   return mockAnalyseGuidance(subject, content);
 };
 
@@ -86,7 +108,9 @@ export const generateTimetable = async (data: ExamPilotData, mode: TimetableMode
     });
     return sanitizeSessions(result.sessions, mode);
   } catch (error) {
+    setAIBackendStatus('error');
     console.warn('Falling back to mock timetable generation:', error);
+    setAIBackendStatus('mock');
     return mockGenerateTimetable(data, mode);
   }
 };
@@ -110,8 +134,10 @@ export const generateFlashcards = async (subject: Subject, guidance: string, dat
       }));
     }
   } catch (error) {
+    setAIBackendStatus('error');
     console.warn('Falling back to mock flashcard generation:', error);
   }
+  setAIBackendStatus('mock');
   return mockGenerateFlashcards(subject, guidance);
 };
 
@@ -124,7 +150,9 @@ export const askExamExpert = async (question: string, subject: Subject | undefin
     const nextSteps = result.suggestedNextSteps?.length ? `\n\nNext steps:\n${result.suggestedNextSteps.map((step) => `- ${step}`).join('\n')}` : '';
     return [`Using context: ${result.contextUsed}`, result.answer, nextSteps].filter(Boolean).join('\n\n');
   } catch (error) {
+    setAIBackendStatus('error');
     console.warn('Falling back to mock Exam Expert response:', error);
+    setAIBackendStatus('mock');
     return mockAskExamExpert(question, subject, data);
   }
 };
@@ -168,8 +196,10 @@ export const generatePracticeQuestions = async (
       }));
     }
   } catch (error) {
+    setAIBackendStatus('error');
     console.warn('Falling back to mock quiz generation:', error);
   }
+  setAIBackendStatus('mock');
   return mockGeneratePracticeQuestions(subject, topic);
 };
 

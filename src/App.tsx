@@ -6,15 +6,29 @@ import {
   CalendarDays,
   Check,
   ChevronRight,
+  CircleDot,
   Clock3,
+  Command,
   Download,
   FileText,
+  Flame,
   Import,
+  Keyboard,
+  Layers3,
+  Library,
+  ListChecks,
   MessageSquareText,
+  Moon,
+  MoreHorizontal,
+  Pause,
+  Play,
   Plus,
+  RotateCcw,
   Search,
   Sparkles,
   Target,
+  TimerReset,
+  Trash2,
   Upload,
 } from 'lucide-react';
 import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useState } from 'react';
@@ -25,13 +39,17 @@ import {
   generateFlashcards,
   generatePracticeQuestions,
   generateTimetable,
+  subscribeAIBackendStatus,
+  type AIBackendStatus,
 } from './services/ai';
 import { exportData, importData, loadData, saveData } from './services/storage';
 import type {
   AIMessage,
   ConfidenceLevel,
   ExamPilotData,
+  Flashcard,
   FlashcardDifficulty,
+  PracticeQuestion,
   PracticeResult,
   PriorityLevel,
   Subject,
@@ -40,61 +58,51 @@ import type {
   WeakTopic,
 } from './types';
 
-const colours = ['#0f766e', '#2563eb', '#7c3aed', '#be123c', '#ca8a04', '#475569'];
-const priorities: PriorityLevel[] = ['Low', 'Medium', 'High', 'Critical'];
-const modes: TimetableMode[] = ['Light', 'Normal', 'Panic'];
+type View = 'Dashboard' | 'Subject' | 'Guidance' | 'Timetable' | 'Flashcards' | 'AI' | 'Practice' | 'Review' | 'Analytics';
+type FlashcardSettings = 'definitions' | 'exam questions' | 'dates' | 'formulas' | 'vocab' | 'essay evidence';
+
 const today = () => new Date().toISOString().slice(0, 10);
 const newId = (prefix: string) => `${prefix}-${crypto.randomUUID()}`;
-
-const daysUntil = (date: string) => {
-  const end = new Date(`${date}T12:00:00`);
-  const start = new Date();
-  start.setHours(12, 0, 0, 0);
-  return Math.ceil((end.getTime() - start.getTime()) / 86400000);
-};
+const priorities: PriorityLevel[] = ['Low', 'Medium', 'High', 'Critical'];
+const modes: TimetableMode[] = ['Light', 'Normal', 'Panic'];
+const swatches = ['#334155', '#0f766e', '#1d4ed8', '#6d28d9', '#9f1239', '#a16207'];
+const navItems: Array<[View, ReactNode, string]> = [
+  ['Dashboard', <Target size={17} />, 'Overview'],
+  ['Subject', <Layers3 size={17} />, 'Subject centre'],
+  ['Guidance', <FileText size={17} />, 'Guidance'],
+  ['Timetable', <CalendarDays size={17} />, 'Timetable'],
+  ['Flashcards', <BookOpen size={17} />, 'Cards'],
+  ['AI', <MessageSquareText size={17} />, 'Exam Expert'],
+  ['Practice', <Brain size={17} />, 'Practice'],
+  ['Review', <ListChecks size={17} />, 'Daily review'],
+  ['Analytics', <BarChart3 size={17} />, 'Analytics'],
+];
 
 const priorityRank: Record<PriorityLevel, number> = { Low: 1, Medium: 2, High: 3, Critical: 4 };
 
 function App() {
   const [data, setData] = useState<ExamPilotData>(() => loadData());
   const [query, setQuery] = useState('');
+  const [activeView, setActiveView] = useState<View>('Dashboard');
   const [activeSubjectId, setActiveSubjectId] = useState('');
-  const [activeTab, setActiveTab] = useState('Dashboard');
   const [mode, setMode] = useState<TimetableMode>('Normal');
+  const [aiStatus, setAiStatus] = useState<AIBackendStatus>('idle');
 
   useEffect(() => saveData(data), [data]);
+  useEffect(() => subscribeAIBackendStatus(setAiStatus), []);
   useEffect(() => {
     if (!activeSubjectId && data.subjects[0]) setActiveSubjectId(data.subjects[0].id);
   }, [activeSubjectId, data.subjects]);
 
   const activeSubject = data.subjects.find((subject) => subject.id === activeSubjectId);
-  const filtered = useMemo(() => filterData(data, query), [data, query]);
+  const filteredSubjects = useMemo(() => filterSubjects(data, query), [data, query]);
   const analytics = useMemo(() => getAnalytics(data), [data]);
+  const nextBlock = useMemo(() => getNextBestBlock(data), [data]);
   const attention = useMemo(() => getAttentionList(data), [data]);
 
   const updateData = (updater: (current: ExamPilotData) => ExamPilotData) => setData((current) => updater(current));
   const upsertWeakTopic = (subjectId: string, topic: string, source: string, delta = 1) => {
-    updateData((current) => {
-      const found = current.weakTopics.find(
-        (weak) => weak.subjectId === subjectId && weak.topic.toLowerCase() === topic.toLowerCase(),
-      );
-      const weakTopics = found
-        ? current.weakTopics.map((weak) =>
-            weak.id === found.id
-              ? {
-                  ...weak,
-                  score: Math.min(10, weak.score + delta),
-                  sources: Array.from(new Set([...weak.sources, source])),
-                  updatedAt: new Date().toISOString(),
-                }
-              : weak,
-          )
-        : [
-            ...current.weakTopics,
-            { id: newId('weak'), subjectId, topic, score: Math.max(1, delta), sources: [source], updatedAt: new Date().toISOString() },
-          ];
-      return { ...current, weakTopics };
-    });
+    updateData((current) => upsertWeakTopicInData(current, subjectId, topic, source, delta));
   };
 
   const importBackup = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -104,77 +112,84 @@ function App() {
     event.target.value = '';
   };
 
+  const addAiMessage = (message: AIMessage) => {
+    updateData((current) => ({ ...current, aiMessages: [...current.aiMessages, message] }));
+  };
+
+  const askTonight = async () => {
+    const subject = nextBlock?.subject ?? activeSubject;
+    const question = subject
+      ? `What should I revise tonight for ${subject.name}, and why is it the priority?`
+      : 'What should I revise tonight, and why is it the priority?';
+    const answer = await askExamExpert(question, subject, data);
+    addAiMessage({
+      id: newId('message'),
+      role: 'assistant',
+      content: answer,
+      createdAt: new Date().toISOString(),
+      subjectId: subject?.id,
+      contextSummary: subject ? `${subject.name}, exam ${subject.examDate}` : 'All subjects',
+    });
+    if (subject) setActiveSubjectId(subject.id);
+    setActiveView('AI');
+  };
+
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-950">
-      <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(circle_at_top_left,rgba(20,184,166,0.16),transparent_34%),linear-gradient(135deg,rgba(37,99,235,0.10),transparent_44%)]" />
-      <div className="relative mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 py-5 sm:px-6 lg:px-8">
-        <header className="flex flex-col gap-4 rounded-lg border border-white/80 bg-white/80 p-4 shadow-soft backdrop-blur lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <div className="flex items-center gap-3">
-              <div className="grid h-11 w-11 place-items-center rounded-lg bg-slate-950 text-white">
-                <Sparkles size={20} />
-              </div>
-              <div>
-                <h1 className="text-2xl font-semibold tracking-tight">ExamPilot</h1>
-                <p className="text-sm text-slate-600">A calm revision operating system for serious GCSE and IGCSE preparation.</p>
-              </div>
-            </div>
-          </div>
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-            <label className="relative min-w-0 flex-1 sm:w-72">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={17} />
-              <input
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                className="input pl-10"
-                placeholder="Search subjects, guidance, flashcards..."
+    <div className="min-h-screen bg-stone-50 text-stone-950">
+      <div className="app-shell">
+        <Sidebar
+          subjects={filteredSubjects}
+          activeSubjectId={activeSubjectId}
+          activeView={activeView}
+          query={query}
+          aiStatus={aiStatus}
+          onSearch={setQuery}
+          onView={setActiveView}
+          onSubject={(id) => {
+            setActiveSubjectId(id);
+            setActiveView('Subject');
+          }}
+          onSample={() => setData(sampleData)}
+          onExport={() => exportData(data)}
+          onImport={importBackup}
+          onAddSubject={(subject) => updateData((current) => ({ ...current, subjects: [subject, ...current.subjects] }))}
+        />
+
+        <div className="main-stage">
+          <TopBar
+            query={query}
+            activeSubject={activeSubject}
+            aiStatus={aiStatus}
+            onSearch={setQuery}
+            onTonight={askTonight}
+            onImport={importBackup}
+            onExport={() => exportData(data)}
+          />
+
+          <main className="content-grid">
+            {activeView === 'Dashboard' && (
+              <Dashboard
+                data={data}
+                analytics={analytics}
+                attention={attention}
+                nextBlock={nextBlock}
+                aiStatus={aiStatus}
+                onTonight={askTonight}
+                onView={setActiveView}
+                onSubject={setActiveSubjectId}
               />
-            </label>
-            <button className="btn-secondary" onClick={() => exportData(data)}>
-              <Download size={17} /> Backup
-            </button>
-            <label className="btn-secondary cursor-pointer">
-              <Upload size={17} /> Import
-              <input className="hidden" type="file" accept="application/json" onChange={importBackup} />
-            </label>
-          </div>
-        </header>
-
-        <nav className="flex gap-2 overflow-x-auto pb-1">
-          {[
-            ['Dashboard', Target],
-            ['Guidance', FileText],
-            ['Timetable', CalendarDays],
-            ['Flashcards', BookOpen],
-            ['Exam Expert AI', MessageSquareText],
-            ['Practice', Brain],
-            ['Analytics', BarChart3],
-          ].map(([tab, Icon]) => (
-            <button key={String(tab)} className={`tab ${activeTab === tab ? 'tab-active' : ''}`} onClick={() => setActiveTab(String(tab))}>
-              <Icon size={16} /> {String(tab)}
-            </button>
-          ))}
-        </nav>
-
-        <main className="grid gap-6 lg:grid-cols-[280px_1fr]">
-          <aside className="space-y-4">
-            <SubjectForm onAdd={(subject) => updateData((current) => ({ ...current, subjects: [subject, ...current.subjects] }))} />
-            <SubjectRail
-              subjects={filtered.subjects}
-              activeSubjectId={activeSubjectId}
-              onSelect={setActiveSubjectId}
-              weakTopics={data.weakTopics}
-            />
-            <button className="btn-secondary w-full justify-center" onClick={() => setData(sampleData)}>
-              <Import size={17} /> Load labelled sample data
-            </button>
-          </aside>
-
-          <section className="min-w-0">
-            {activeTab === 'Dashboard' && (
-              <Dashboard data={data} attention={attention} analytics={analytics} activeSubject={activeSubject} setTab={setActiveTab} />
             )}
-            {activeTab === 'Guidance' && activeSubject && (
+            {activeView === 'Subject' && activeSubject && (
+              <SubjectCentre
+                data={data}
+                subject={activeSubject}
+                updateData={updateData}
+                onView={setActiveView}
+                onWeakTopic={upsertWeakTopic}
+                onAskTonight={askTonight}
+              />
+            )}
+            {activeView === 'Guidance' && activeSubject && (
               <GuidancePanel
                 data={data}
                 subject={activeSubject}
@@ -182,152 +197,436 @@ function App() {
                 onWeakTopic={(topic) => upsertWeakTopic(activeSubject.id, topic, 'AI guidance analysis', 2)}
               />
             )}
-            {activeTab === 'Timetable' && (
+            {activeView === 'Timetable' && (
               <TimetablePanel data={data} updateData={updateData} mode={mode} setMode={setMode} />
             )}
-            {activeTab === 'Flashcards' && activeSubject && (
-              <FlashcardPanel data={data} subject={activeSubject} updateData={updateData} onWeakTopic={upsertWeakTopic} />
+            {activeView === 'Flashcards' && (
+              <FlashcardPanel data={data} activeSubject={activeSubject} updateData={updateData} onWeakTopic={upsertWeakTopic} />
             )}
-            {activeTab === 'Exam Expert AI' && (
-              <ExamExpertPanel data={data} activeSubject={activeSubject} activeSubjectId={activeSubjectId} setActiveSubjectId={setActiveSubjectId} updateData={updateData} />
+            {activeView === 'AI' && (
+              <ExamExpertPanel
+                data={data}
+                activeSubject={activeSubject}
+                activeSubjectId={activeSubjectId}
+                setActiveSubjectId={setActiveSubjectId}
+                updateData={updateData}
+                aiStatus={aiStatus}
+                onWeakTopic={upsertWeakTopic}
+              />
             )}
-            {activeTab === 'Practice' && activeSubject && (
+            {activeView === 'Practice' && activeSubject && (
               <PracticePanel data={data} subject={activeSubject} updateData={updateData} onWeakTopic={upsertWeakTopic} />
             )}
-            {activeTab === 'Analytics' && <AnalyticsPanel data={data} analytics={analytics} />}
-            {!activeSubject && activeTab !== 'Dashboard' && activeTab !== 'Timetable' && activeTab !== 'Analytics' && (
-              <EmptyState title="Add a subject to unlock this workspace" body="ExamPilot builds its recommendations from your subjects, exam dates, guidance, flashcards, and mistakes." />
+            {activeView === 'Review' && (
+              <DailyReviewPanel data={data} analytics={analytics} nextBlock={nextBlock} onTonight={askTonight} onView={setActiveView} />
             )}
-          </section>
-        </main>
+            {activeView === 'Analytics' && <AnalyticsPanel data={data} analytics={analytics} />}
+            {!activeSubject && activeView !== 'Dashboard' && activeView !== 'Timetable' && activeView !== 'Analytics' && activeView !== 'Review' && (
+              <EmptyState title="Add a subject to unlock this workspace" body="ExamPilot builds its recommendations from subjects, exam dates, guidance, flashcards, sessions, and mistakes." />
+            )}
+          </main>
+        </div>
       </div>
+
+      <MobileNav activeView={activeView} onView={setActiveView} />
     </div>
   );
 }
 
-function SubjectForm({ onAdd }: { onAdd: (subject: Subject) => void }) {
-  const [name, setName] = useState('');
-  const [examDate, setExamDate] = useState(today());
-  const [priority, setPriority] = useState<PriorityLevel>('Medium');
-  const [confidence, setConfidence] = useState<ConfidenceLevel>(3);
-  const [colour, setColour] = useState(colours[0]);
-  const [notes, setNotes] = useState('');
+function Sidebar({
+  subjects,
+  activeSubjectId,
+  activeView,
+  query,
+  aiStatus,
+  onSearch,
+  onView,
+  onSubject,
+  onSample,
+  onExport,
+  onImport,
+  onAddSubject,
+}: {
+  subjects: Subject[];
+  activeSubjectId: string;
+  activeView: View;
+  query: string;
+  aiStatus: AIBackendStatus;
+  onSearch: (value: string) => void;
+  onView: (view: View) => void;
+  onSubject: (id: string) => void;
+  onSample: () => void;
+  onExport: () => void;
+  onImport: (event: ChangeEvent<HTMLInputElement>) => void;
+  onAddSubject: (subject: Subject) => void;
+}) {
+  return (
+    <aside className="sidebar">
+      <div className="brand-row">
+        <div className="brand-mark">EP</div>
+        <div>
+          <h1>ExamPilot</h1>
+          <p>Revision command centre</p>
+        </div>
+      </div>
 
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
-    if (!name.trim()) return;
-    onAdd({ id: newId('subject'), name: name.trim(), examDate, priority, confidence, colour, notes, createdAt: new Date().toISOString() });
-    setName('');
-    setNotes('');
+      <label className="command-input">
+        <Command size={15} />
+        <input value={query} onChange={(event) => onSearch(event.target.value)} placeholder="Search everything" />
+      </label>
+
+      <div className="nav-section">
+        {navItems.map(([view, icon, label]) => (
+          <button key={view} className={`nav-item ${activeView === view ? 'nav-item-active' : ''}`} onClick={() => onView(view)}>
+            {icon}
+            <span>{label}</span>
+          </button>
+        ))}
+      </div>
+
+      <div className="sidebar-block">
+        <div className="sidebar-heading">Subjects</div>
+        <div className="subject-stack">
+          {subjects.length ? subjects.map((subject) => (
+            <button key={subject.id} className={`subject-chip ${activeSubjectId === subject.id ? 'subject-chip-active' : ''}`} onClick={() => onSubject(subject.id)}>
+              <span className="subject-colour" style={{ background: subject.colour }} />
+              <span className="min-w-0">
+                <span className="block truncate">{subject.name}</span>
+                <span className="text-[11px] text-stone-500">{formatCountdown(subject.examDate)} · {subject.priority}</span>
+              </span>
+            </button>
+          )) : <p className="empty-note">No subjects yet. Start clean or load sample data.</p>}
+        </div>
+      </div>
+
+      <SubjectForm onAdd={onAddSubject} compact />
+
+      <div className="sidebar-footer">
+        <AIStatusPill status={aiStatus} />
+        <div className="grid grid-cols-3 gap-2">
+          <button type="button" className="icon-button" title="Backup" onClick={onExport}><Download size={15} /></button>
+          <label className="icon-button cursor-pointer" title="Import">
+            <Upload size={15} />
+            <input className="hidden" type="file" accept="application/json" onChange={onImport} />
+          </label>
+          <button type="button" className="icon-button" title="Load sample data" onClick={onSample}><Import size={15} /></button>
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+function TopBar({
+  query,
+  activeSubject,
+  aiStatus,
+  onSearch,
+  onTonight,
+  onImport,
+  onExport,
+}: {
+  query: string;
+  activeSubject?: Subject;
+  aiStatus: AIBackendStatus;
+  onSearch: (value: string) => void;
+  onTonight: () => void;
+  onImport: (event: ChangeEvent<HTMLInputElement>) => void;
+  onExport: () => void;
+}) {
+  return (
+    <header className="topbar">
+      <div>
+        <p className="eyebrow">Today</p>
+        <h2>{activeSubject ? `${activeSubject.name} in focus` : 'Exam season overview'}</h2>
+      </div>
+      <label className="top-search">
+        <Search size={16} />
+        <input value={query} onChange={(event) => onSearch(event.target.value)} placeholder="Search subjects, guidance, weak topics, cards" />
+        <kbd>/</kbd>
+      </label>
+      <div className="top-actions">
+        <AIStatusPill status={aiStatus} />
+        <button className="btn-primary" onClick={onTonight}><Moon size={16} /> Tonight</button>
+        <button className="icon-button" title="Backup" onClick={onExport}><Download size={16} /></button>
+        <label className="icon-button cursor-pointer" title="Import">
+          <Upload size={16} />
+          <input className="hidden" type="file" accept="application/json" onChange={onImport} />
+        </label>
+      </div>
+    </header>
+  );
+}
+
+function Dashboard({
+  data,
+  analytics,
+  attention,
+  nextBlock,
+  aiStatus,
+  onTonight,
+  onView,
+  onSubject,
+}: {
+  data: ExamPilotData;
+  analytics: ReturnType<typeof getAnalytics>;
+  attention: string[];
+  nextBlock?: NextBlock;
+  aiStatus: AIBackendStatus;
+  onTonight: () => void;
+  onView: (view: View) => void;
+  onSubject: (id: string) => void;
+}) {
+  const upcoming = [...data.subjects].sort((a, b) => a.examDate.localeCompare(b.examDate)).slice(0, 5);
+  const todaySessions = sessionsForDate(data.sessions, today());
+  const skipped = data.sessions.filter((session) => session.status === 'skipped').slice(0, 3);
+  const dueCards = getDueCards(data.flashcards).slice(0, 4);
+
+  return (
+    <div className="space-y-5">
+      <PageHeader
+        eyebrow="Command brief"
+        title="What should I revise next?"
+        subtitle="ExamPilot prioritises exam distance, subject confidence, weak topics, due cards, skipped work, and saved guidance."
+        action={<button className="btn-primary" onClick={onTonight}><Sparkles size={16} /> Ask AI for tonight</button>}
+      />
+
+      <div className="grid gap-4 xl:grid-cols-[1.4fr_0.9fr]">
+        <section className="panel panel-dark">
+          <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
+            <div className="max-w-xl">
+              <p className="eyebrow text-stone-300">Next best revision block</p>
+              <h3 className="mt-2 text-3xl font-semibold tracking-tight text-white">{nextBlock?.title ?? 'Add a subject to unlock priority guidance'}</h3>
+              <p className="mt-3 text-sm leading-6 text-stone-300">{nextBlock?.reason ?? 'Once you add subjects, ExamPilot will explain what deserves attention and why.'}</p>
+            </div>
+            <div className="grid min-w-52 grid-cols-3 gap-2">
+              <MiniStat label="Due" value={analytics.dueCards} dark />
+              <MiniStat label="Weak" value={data.weakTopics.length} dark />
+              <MiniStat label="Streak" value={`${analytics.streak}d`} dark />
+            </div>
+          </div>
+          <div className="mt-5 flex flex-wrap gap-2">
+            <button className="btn-light" onClick={() => onView('Timetable')}><CalendarDays size={16} /> Schedule</button>
+            <button className="btn-light" onClick={() => onView('Practice')}><Brain size={16} /> Generate quiz</button>
+            <button className="btn-light" onClick={() => onView('Flashcards')}><BookOpen size={16} /> Review cards</button>
+          </div>
+        </section>
+
+        <section className="panel">
+          <div className="section-line">
+            <div>
+              <p className="eyebrow">AI recommendation</p>
+              <h3 className="section-heading">Tonight’s decision support</h3>
+            </div>
+            <AIStatusPill status={aiStatus} />
+          </div>
+          <div className="mt-4 space-y-3">
+            {(attention.length ? attention : ['No pressure signals yet. Add exam dates, guidance, or practice results to make recommendations sharper.']).slice(0, 4).map((item) => (
+              <PriorityLine key={item} text={item} />
+            ))}
+          </div>
+        </section>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-4">
+        <MetricCard label="Revision time" value={`${analytics.revisionHours}h`} sub="completed sessions" />
+        <MetricCard label="Completed" value={analytics.sessionsCompleted} sub={`${analytics.skippedSessions} skipped`} />
+        <MetricCard label="Flashcards due" value={analytics.dueCards} sub={`${analytics.overdueCards} overdue`} />
+        <MetricCard label="Readiness" value={`${analytics.readiness}%`} sub="honest estimate" />
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-[1fr_1fr_0.9fr]">
+        <section className="panel">
+          <SectionTitle icon={<Clock3 size={17} />} title="Today’s plan" />
+          <div className="mt-4 space-y-2">
+            {todaySessions.length ? todaySessions.map((session) => <SessionRow key={session.id} session={session} subject={subjectById(data, session.subjectId)} />) : (
+              <EmptyState title="No sessions today" body="Generate a timetable or add one focused revision block for this evening." compact />
+            )}
+          </div>
+        </section>
+
+        <section className="panel">
+          <SectionTitle icon={<CalendarDays size={17} />} title="Upcoming exam timeline" />
+          <div className="mt-4 space-y-3">
+            {upcoming.length ? upcoming.map((subject) => (
+              <button key={subject.id} className="timeline-row" onClick={() => { onSubject(subject.id); onView('Subject'); }}>
+                <span className="timeline-dot" style={{ background: subject.colour }} />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate font-medium">{subject.name}</span>
+                  <span className="text-xs text-stone-500">{subject.examDate}</span>
+                </span>
+                <span className="countdown">{formatCountdown(subject.examDate)}</span>
+              </button>
+            )) : <EmptyState title="No exams logged" body="Add subjects with exam dates to build a real countdown." compact />}
+          </div>
+        </section>
+
+        <section className="panel">
+          <SectionTitle icon={<AlertTriangle size={17} />} title="Overdue and weak" />
+          <div className="mt-4 space-y-3">
+            {dueCards.length ? dueCards.map((card) => (
+              <CompactLine key={card.id} title={card.topic} meta={`${subjectName(data, card.subjectId)} · due ${card.nextReview}`} />
+            )) : <CompactLine title="No due flashcards" meta="The queue is clear." />}
+            {skipped.length ? skipped.map((session) => (
+              <CompactLine key={session.id} title={`Recover: ${session.title}`} meta={session.reason || 'Missed session needs a smaller replacement.'} />
+            )) : null}
+          </div>
+        </section>
+      </div>
+
+      <section className="panel">
+        <SectionTitle icon={<Layers3 size={17} />} title="Subject priorities" />
+        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          {data.subjects.length ? [...data.subjects].sort((a, b) => priorityRank[b.priority] - priorityRank[a.priority]).map((subject) => (
+            <SubjectPriorityCard key={subject.id} data={data} subject={subject} onOpen={() => { onSubject(subject.id); onView('Subject'); }} />
+          )) : <EmptyState title="No subjects yet" body="Add your GCSE/IGCSE subjects to begin." />}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function SubjectCentre({
+  data,
+  subject,
+  updateData,
+  onView,
+  onWeakTopic,
+  onAskTonight,
+}: {
+  data: ExamPilotData;
+  subject: Subject;
+  updateData: (updater: (current: ExamPilotData) => ExamPilotData) => void;
+  onView: (view: View) => void;
+  onWeakTopic: (subjectId: string, topic: string, source: string, delta?: number) => void;
+  onAskTonight: () => void;
+}) {
+  const guidance = data.guidance.filter((item) => item.subjectId === subject.id);
+  const analysed = guidance.filter((item) => item.analysis);
+  const cards = data.flashcards.filter((card) => card.subjectId === subject.id);
+  const sessions = data.sessions.filter((session) => session.subjectId === subject.id);
+  const questions = data.practiceQuestions.filter((question) => question.subjectId === subject.id);
+  const weak = data.weakTopics.filter((topic) => topic.subjectId === subject.id).sort((a, b) => b.score - a.score);
+  const activity = getRecentActivity(data, subject.id);
+  const readiness = subjectReadiness(data, subject);
+
+  const createChecklist = async () => {
+    const text = guidance.map((item) => item.content).join('\n\n') || subject.notes || `${subject.name} GCSE/IGCSE overview`;
+    const analysis = await analyseGuidance(subject, text, data);
+    updateData((current) => ({
+      ...current,
+      guidance: [
+        {
+          id: newId('guidance'),
+          subjectId: subject.id,
+          title: `${subject.name} AI topic checklist`,
+          content: analysis.suggestedRevisionTasks.join('\n'),
+          analysis,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+        ...current.guidance,
+      ],
+    }));
+    analysis.likelyWeakAreas.forEach((topic) => onWeakTopic(subject.id, topic, 'AI topic checklist', 1));
   };
 
   return (
-    <form className="card space-y-3" onSubmit={submit}>
-      <h2 className="section-title">Add Subject</h2>
-      <input className="input" value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Chemistry" />
-      <input className="input" type="date" value={examDate} onChange={(event) => setExamDate(event.target.value)} />
-      <div className="grid grid-cols-2 gap-2">
-        <select className="input" value={priority} onChange={(event) => setPriority(event.target.value as PriorityLevel)}>
-          {priorities.map((item) => (
-            <option key={item}>{item}</option>
-          ))}
-        </select>
-        <select className="input" value={confidence} onChange={(event) => setConfidence(Number(event.target.value) as ConfidenceLevel)}>
-          {[1, 2, 3, 4, 5].map((item) => (
-            <option key={item} value={item}>{`Confidence ${item}`}</option>
-          ))}
-        </select>
-      </div>
-      <div className="flex gap-2">
-        {colours.map((swatch) => (
-          <button
-            type="button"
-            title={swatch}
-            key={swatch}
-            className={`h-7 flex-1 rounded-md border-2 ${colour === swatch ? 'border-slate-950' : 'border-white'}`}
-            style={{ background: swatch }}
-            onClick={() => setColour(swatch)}
-          />
-        ))}
-      </div>
-      <textarea className="input min-h-20" value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="Notes, risks, teacher advice..." />
-      <button className="btn-primary w-full justify-center">
-        <Plus size={17} /> Add subject
-      </button>
-    </form>
-  );
-}
+    <div className="space-y-5">
+      <PageHeader
+        eyebrow="Subject command centre"
+        title={subject.name}
+        subtitle={`${formatCountdown(subject.examDate)} until exam · ${subject.priority} priority · confidence ${subject.confidence}/5`}
+        action={<button className="btn-primary" onClick={onAskTonight}><Sparkles size={16} /> What tonight?</button>}
+      />
 
-function SubjectRail({ subjects, activeSubjectId, onSelect, weakTopics }: { subjects: Subject[]; activeSubjectId: string; onSelect: (id: string) => void; weakTopics: WeakTopic[] }) {
-  if (!subjects.length) return <EmptyState title="No subjects yet" body="Start empty, or load labelled sample data when you want to explore the flow." />;
-  return (
-    <div className="card space-y-3">
-      <h2 className="section-title">Subjects</h2>
-      {subjects.map((subject) => {
-        const weakCount = weakTopics.filter((topic) => topic.subjectId === subject.id).length;
-        return (
-          <button key={subject.id} className={`subject-button ${activeSubjectId === subject.id ? 'subject-button-active' : ''}`} onClick={() => onSelect(subject.id)}>
-            <span className="h-9 w-1.5 rounded-full" style={{ background: subject.colour }} />
-            <span className="min-w-0 flex-1 text-left">
-              <span className="block truncate font-medium">{subject.name}</span>
-              <span className="text-xs text-slate-500">{daysUntil(subject.examDate)} days · {subject.priority} · {weakCount} weak</span>
-            </span>
-            <ChevronRight size={16} />
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function Dashboard({ data, attention, analytics, activeSubject, setTab }: { data: ExamPilotData; attention: string[]; analytics: ReturnType<typeof getAnalytics>; activeSubject?: Subject; setTab: (tab: string) => void }) {
-  return (
-    <div className="space-y-6">
-      <div className="hero">
-        <div className="max-w-2xl">
-          <p className="eyebrow">Today’s command brief</p>
-          <h2 className="text-3xl font-semibold tracking-tight sm:text-4xl">What should I revise next, and why?</h2>
-          <p className="mt-3 text-slate-600">
-            ExamPilot weighs exam distance, priority, confidence, missed questions, due cards, and stored guidance before suggesting the next useful action.
-          </p>
-        </div>
-        <button className="btn-primary" onClick={() => setTab('Timetable')}>
-          <Sparkles size={17} /> Build timetable
-        </button>
-      </div>
       <div className="grid gap-4 md:grid-cols-4">
-        <Metric label="Subjects" value={data.subjects.length} />
-        <Metric label="Completed sessions" value={analytics.sessionsCompleted} />
-        <Metric label="Flashcards due" value={analytics.dueCards} />
-        <Metric label="Revision time" value={`${analytics.revisionHours}h`} />
+        <MetricCard label="Exam countdown" value={formatCountdown(subject.examDate)} sub={subject.examDate} />
+        <MetricCard label="Confidence" value={`${subject.confidence}/5`} sub="self-rated" />
+        <MetricCard label="Mastery" value={`${readiness}%`} sub="from current signals" />
+        <MetricCard label="Due cards" value={cards.filter((card) => card.nextReview <= today()).length} sub={`${cards.length} total`} />
       </div>
+
       <div className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
-        <div className="card">
-          <h3 className="section-title">Needs Attention Today</h3>
-          {attention.length ? (
-            <div className="mt-4 space-y-3">
-              {attention.map((item) => (
-                <div key={item} className="flex gap-3 rounded-lg border border-slate-200 bg-white p-3">
-                  <AlertTriangle className="mt-0.5 text-amber-600" size={18} />
-                  <p className="text-sm text-slate-700">{item}</p>
+        <section className="panel">
+          <div className="section-line">
+            <SectionTitle icon={<Library size={17} />} title="Topic map and mastery" />
+            <button className="btn-secondary" onClick={createChecklist}><Sparkles size={15} /> AI checklist</button>
+          </div>
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
+            {topicMasteryRows(subject, data).length ? topicMasteryRows(subject, data).map((row) => (
+              <div key={row.topic} className="topic-card">
+                <div className="flex items-center justify-between gap-3">
+                  <h3>{row.topic}</h3>
+                  <span className="pill">{row.level}</span>
                 </div>
-              ))}
-            </div>
-          ) : (
-            <EmptyState title="No pressure signals yet" body="Add subjects, guidance, sessions, flashcards, or practice results to make the attention list meaningful." />
-          )}
-        </div>
-        <div className="card">
-          <h3 className="section-title">Active Context</h3>
-          {activeSubject ? (
-            <div className="mt-4 space-y-3">
-              <SubjectSummary subject={activeSubject} />
-              <p className="rounded-lg bg-slate-100 p-3 text-sm text-slate-700">{activeSubject.notes || 'No subject notes yet.'}</p>
-            </div>
-          ) : (
-            <EmptyState title="No active subject" body="Add a subject to start building context." />
-          )}
-        </div>
+                <div className="mt-3 h-1.5 rounded-full bg-stone-200">
+                  <div className="h-1.5 rounded-full bg-stone-900" style={{ width: `${row.score}%` }} />
+                </div>
+                <p className="mt-2 text-xs text-stone-500">{row.reason}</p>
+              </div>
+            )) : <EmptyState title="No topic map yet" body="Analyse guidance or generate practice to build topic mastery." />}
+          </div>
+        </section>
+
+        <section className="panel">
+          <SectionTitle icon={<AlertTriangle size={17} />} title="Weak topics" />
+          <div className="mt-4 space-y-2">
+            {weak.length ? weak.slice(0, 6).map((topic) => (
+              <button
+                key={topic.id}
+                className="weak-row"
+                onClick={() => updateData((current) => ({
+                  ...current,
+                  sessions: [{
+                    id: newId('session'),
+                    subjectId: subject.id,
+                    title: `${subject.name}: recover ${topic.topic}`,
+                    type: 'revision',
+                    date: today(),
+                    startTime: '19:30',
+                    durationMinutes: 35,
+                    mode: 'Normal',
+                    status: 'planned',
+                    topic: topic.topic,
+                    reason: `Created from weak-topic signal: ${topic.sources.join(', ')}`,
+                  }, ...current.sessions],
+                }))}
+              >
+                <span>{topic.topic}</span>
+                <span className="pill">score {topic.score}</span>
+              </button>
+            )) : <EmptyState title="No weak topics yet" body="Mark practice and flashcards honestly to reveal them." compact />}
+          </div>
+        </section>
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-3">
+        <SubjectMiniPanel title="Guidance" count={guidance.length} button="Open" onClick={() => onView('Guidance')}>
+          {analysed[0]?.analysis ? <AnalysisCompact analysis={analysed[0].analysis} /> : <p className="muted">Paste guidance and run analysis to extract a topic map.</p>}
+        </SubjectMiniPanel>
+        <SubjectMiniPanel title="Flashcards" count={cards.length} button="Review" onClick={() => onView('Flashcards')}>
+          {cards.slice(0, 3).map((card) => <CompactLine key={card.id} title={card.topic} meta={card.question} />)}
+          {!cards.length && <p className="muted">No cards yet.</p>}
+        </SubjectMiniPanel>
+        <SubjectMiniPanel title="Practice bank" count={questions.length} button="Practise" onClick={() => onView('Practice')}>
+          {questions.slice(0, 3).map((question) => <CompactLine key={question.id} title={question.type} meta={question.prompt} />)}
+          {!questions.length && <p className="muted">Generate exam-style questions from the current guidance.</p>}
+        </SubjectMiniPanel>
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-[1fr_0.8fr]">
+        <section className="panel">
+          <SectionTitle icon={<CalendarDays size={17} />} title="Revision sessions" />
+          <div className="mt-4 space-y-2">
+            {sessions.length ? sessions.slice(0, 6).map((session) => <SessionRow key={session.id} session={session} subject={subject} />) : <EmptyState title="No sessions" body="Create one from a weak topic or generate a timetable." compact />}
+          </div>
+        </section>
+        <section className="panel">
+          <SectionTitle icon={<MoreHorizontal size={17} />} title="Recent activity" />
+          <div className="mt-4 space-y-2">
+            {activity.length ? activity.map((item) => <CompactLine key={item.title + item.meta} title={item.title} meta={item.meta} />) : <EmptyState title="No recent activity" body="Reviews, sessions, and practice attempts will appear here." compact />}
+          </div>
+        </section>
       </div>
     </div>
   );
@@ -362,29 +661,25 @@ function GuidancePanel({ data, subject, updateData, onWeakTopic }: { data: ExamP
   };
 
   return (
-    <Panel title="Revision Guidance Library" subtitle={`${subject.name}: paste checklists, specifications, teacher advice, and mark-scheme notes.`}>
-      <form className="grid gap-3 lg:grid-cols-[260px_1fr_auto]" onSubmit={addGuidance}>
+    <Panel eyebrow="Guidance library" title={`${subject.name} source material`} subtitle="Store specification notes, teacher advice, mark schemes, and syllabus checklists by subject.">
+      <form className="premium-form" onSubmit={addGuidance}>
         <input className="input" value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Guidance title" />
-        <textarea className="input min-h-24" value={content} onChange={(event) => setContent(event.target.value)} placeholder="Paste revision guidance here..." />
-        <button className="btn-primary self-start">
-          <Plus size={17} /> Save
-        </button>
+        <textarea className="input min-h-28 lg:col-span-2" value={content} onChange={(event) => setContent(event.target.value)} placeholder="Paste specification notes, teacher advice, or mark-scheme guidance..." />
+        <button className="btn-primary self-start"><Plus size={16} /> Save guidance</button>
       </form>
-      <div className="mt-5 space-y-4">
+      <div className="mt-5 space-y-3">
         {subjectGuidance.length ? subjectGuidance.map((item) => (
-          <article key={item.id} className="rounded-lg border border-slate-200 bg-white p-4">
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <article key={item.id} className="document-card">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
               <div>
-                <h3 className="font-semibold">{item.title}</h3>
-                <p className="mt-1 whitespace-pre-wrap text-sm text-slate-600">{item.content}</p>
+                <h3>{item.title}</h3>
+                <p>{item.content}</p>
               </div>
-              <button className="btn-secondary shrink-0" onClick={() => analyse(item.id, item.content)}>
-                <Sparkles size={17} /> Analyse with AI
-              </button>
+              <button className="btn-secondary shrink-0" onClick={() => analyse(item.id, item.content)}><Sparkles size={16} /> Analyse with AI</button>
             </div>
             {item.analysis && <AnalysisGrid analysis={item.analysis} />}
           </article>
-        )) : <EmptyState title="No guidance saved" body="Your AI context starts here. Paste the exact advice your teacher or specification gives you." />}
+        )) : <EmptyState title="No guidance saved" body="Paste the exact information your teacher or specification gives you. This becomes the AI context." />}
       </div>
     </Panel>
   );
@@ -398,6 +693,9 @@ function TimetablePanel({ data, updateData, mode, setMode }: { data: ExamPilotDa
   const [startTime, setStartTime] = useState('18:00');
   const [duration, setDuration] = useState(45);
   const [topic, setTopic] = useState('');
+
+  const todayItems = sessionsForDate(data.sessions, today());
+  const week = nextSevenDays();
 
   const addSession = (event: FormEvent) => {
     event.preventDefault();
@@ -421,90 +719,127 @@ function TimetablePanel({ data, updateData, mode, setMode }: { data: ExamPilotDa
   const updateSession = (id: string, patch: Partial<TimetableSession>) =>
     updateData((current) => ({ ...current, sessions: current.sessions.map((session) => (session.id === id ? { ...session, ...patch } : session)) }));
 
+  const deleteSession = (id: string) => updateData((current) => ({ ...current, sessions: current.sessions.filter((session) => session.id !== id) }));
+
   const markSkipped = (session: TimetableSession) => {
-    updateSession(session.id, { status: 'skipped' });
     const date = new Date(`${session.date}T12:00:00`);
     date.setDate(date.getDate() + 1);
     updateData((current) => ({
       ...current,
       sessions: [
-        {
-          ...session,
-          id: newId('session'),
-          date: date.toISOString().slice(0, 10),
-          status: 'planned',
-          reason: `Rescheduled because "${session.title}" was skipped.`,
-        },
-        ...current.sessions,
+        { ...session, id: newId('session'), date: date.toISOString().slice(0, 10), status: 'planned' as const, durationMinutes: Math.max(25, session.durationMinutes - 10), reason: `Recovery block for skipped session: ${session.title}` },
+        ...current.sessions.map((item) => (item.id === session.id ? { ...item, status: 'skipped' as const } : item)),
       ],
     }));
   };
 
   return (
-    <Panel title="Smart Revision Timetable" subtitle="Blend fixed commitments with revision sessions, then generate a schedule from priority, exam dates, and weak areas.">
-      <div className="mb-4 flex flex-wrap gap-2">
-        {modes.map((item) => (
-          <button key={item} className={`chip ${mode === item ? 'chip-active' : ''}`} onClick={() => setMode(item)}>{item}</button>
-        ))}
-        <button className="btn-primary ml-auto" onClick={generate}>
-          <Sparkles size={17} /> Generate Timetable with AI
-        </button>
-      </div>
-      <form className="grid gap-3 lg:grid-cols-6" onSubmit={addSession}>
-        <input className="input lg:col-span-2" value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Session or commitment" />
-        <select className="input" value={subjectId} onChange={(event) => setSubjectId(event.target.value)}>
-          <option value="">No subject</option>
-          {data.subjects.map((subject) => <option key={subject.id} value={subject.id}>{subject.name}</option>)}
-        </select>
-        <select className="input" value={type} onChange={(event) => setType(event.target.value as TimetableSession['type'])}>
-          {['revision', 'lesson', 'chapel', 'meal', 'music', 'prep', 'sport', 'free-time', 'exam'].map((item) => <option key={item}>{item}</option>)}
-        </select>
-        <input className="input" type="date" value={date} onChange={(event) => setDate(event.target.value)} />
-        <input className="input" type="time" value={startTime} onChange={(event) => setStartTime(event.target.value)} />
-        <input className="input" type="number" min={10} value={duration} onChange={(event) => setDuration(Number(event.target.value))} />
-        <input className="input lg:col-span-5" value={topic} onChange={(event) => setTopic(event.target.value)} placeholder="Topic or purpose" />
-        <button className="btn-secondary justify-center"><Plus size={17} /> Add</button>
-      </form>
-      <div className="mt-5 space-y-3">
-        {data.sessions.length ? [...data.sessions]
-          .sort((a, b) => `${a.date}${a.startTime}`.localeCompare(`${b.date}${b.startTime}`))
-          .map((session) => (
-            <article key={session.id} className="grid gap-3 rounded-lg border border-slate-200 bg-white p-4 md:grid-cols-[1fr_auto]">
-              <div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="pill">{session.type}</span>
-                  <span className="pill">{session.mode}</span>
-                  <span className={`pill ${session.status === 'done' ? 'bg-emerald-100 text-emerald-800' : session.status === 'skipped' ? 'bg-rose-100 text-rose-800' : ''}`}>{session.status}</span>
+    <div className="space-y-5">
+      <PageHeader
+        eyebrow="Timetable"
+        title="Weekly revision plan"
+        subtitle="Fixed school commitments and flexible revision blocks, with recovery suggestions for missed sessions."
+        action={<button className="btn-primary" onClick={generate}><Sparkles size={16} /> Regenerate with constraints</button>}
+      />
+
+      <section className="panel">
+        <div className="flex flex-wrap gap-2">
+          {modes.map((item) => <button key={item} className={`chip ${mode === item ? 'chip-active' : ''}`} onClick={() => setMode(item)}>{item}</button>)}
+          {['music practice included', 'school commitments included', 'light day'].map((item) => <span key={item} className="constraint-chip">{item}</span>)}
+        </div>
+        <form className="mt-4 grid gap-3 lg:grid-cols-7" onSubmit={addSession}>
+          <input className="input lg:col-span-2" value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Session or commitment" />
+          <select className="input" value={subjectId} onChange={(event) => setSubjectId(event.target.value)}>
+            <option value="">No subject</option>
+            {data.subjects.map((subject) => <option key={subject.id} value={subject.id}>{subject.name}</option>)}
+          </select>
+          <select className="input" value={type} onChange={(event) => setType(event.target.value as TimetableSession['type'])}>
+            {['revision', 'lesson', 'chapel', 'meal', 'music', 'prep', 'sport', 'free-time', 'exam'].map((item) => <option key={item}>{item}</option>)}
+          </select>
+          <input className="input" type="date" value={date} onChange={(event) => setDate(event.target.value)} />
+          <input className="input" type="time" value={startTime} onChange={(event) => setStartTime(event.target.value)} />
+          <button className="btn-secondary justify-center"><Plus size={16} /> Add</button>
+          <input className="input lg:col-span-2" type="number" min={10} value={duration} onChange={(event) => setDuration(Number(event.target.value))} />
+          <input className="input lg:col-span-5" value={topic} onChange={(event) => setTopic(event.target.value)} placeholder="Topic, constraint, or purpose" />
+        </form>
+      </section>
+
+      <div className="grid gap-4 xl:grid-cols-[0.8fr_1.4fr]">
+        <section className="panel">
+          <SectionTitle icon={<Clock3 size={17} />} title="Today view" />
+          <div className="mt-4 space-y-2">
+            {todayItems.length ? todayItems.map((session) => (
+              <EditableSessionRow key={session.id} session={session} subject={subjectById(data, session.subjectId)} onUpdate={updateSession} onSkip={markSkipped} onDelete={deleteSession} />
+            )) : <EmptyState title="Nothing booked today" body="Add one fixed commitment or a short revision block." compact />}
+          </div>
+        </section>
+
+        <section className="panel overflow-hidden">
+          <SectionTitle icon={<CalendarDays size={17} />} title="Weekly calendar" />
+          <div className="weekly-grid mt-4">
+            {week.map((day) => (
+              <div key={day.date} className="day-column">
+                <div className="day-heading">
+                  <span>{day.label}</span>
+                  <small>{day.date.slice(5)}</small>
                 </div>
-                <h3 className="mt-2 font-semibold">{session.title}</h3>
-                <p className="text-sm text-slate-600">{session.date} at {session.startTime} · {session.durationMinutes} min · {session.topic || 'No topic'}</p>
-                {session.reason && <p className="mt-2 text-sm text-slate-500">{session.reason}</p>}
+                <div className="space-y-2">
+                  {sessionsForDate(data.sessions, day.date).slice(0, 5).map((session) => <CalendarBlock key={session.id} session={session} subject={subjectById(data, session.subjectId)} />)}
+                </div>
               </div>
-              <div className="flex flex-wrap gap-2 md:justify-end">
-                <button className="btn-secondary" onClick={() => updateSession(session.id, { status: 'done' })}><Check size={16} /> Done</button>
-                <button className="btn-secondary" onClick={() => markSkipped(session)}>Skip</button>
-                <input className="input w-32" type="time" value={session.startTime} onChange={(event) => updateSession(session.id, { startTime: event.target.value })} />
-                <input className="input w-36" type="date" value={session.date} onChange={(event) => updateSession(session.id, { date: event.target.value })} />
-              </div>
-            </article>
-          )) : <EmptyState title="No timetable yet" body="Add fixed commitments first, then generate revision around the real shape of your day." />}
+            ))}
+          </div>
+        </section>
       </div>
-    </Panel>
+
+      <section className="panel">
+        <SectionTitle icon={<RotateCcw size={17} />} title="Missed-session recovery" />
+        <div className="mt-4 grid gap-3 md:grid-cols-2">
+          {data.sessions.filter((session) => session.status === 'skipped').length ? data.sessions.filter((session) => session.status === 'skipped').map((session) => (
+            <div key={session.id} className="recovery-card">
+              <h3>{session.title}</h3>
+              <p>Suggested recovery: halve the scope, keep the same topic, and complete a 25-minute block within 24 hours.</p>
+              <button className="btn-secondary" onClick={() => markSkipped(session)}><Plus size={15} /> Add recovery block</button>
+            </div>
+          )) : <EmptyState title="No skipped sessions" body="Recovery suggestions will appear when something is missed." compact />}
+        </div>
+      </section>
+    </div>
   );
 }
 
-function FlashcardPanel({ data, subject, updateData, onWeakTopic }: { data: ExamPilotData; subject: Subject; updateData: (updater: (current: ExamPilotData) => ExamPilotData) => void; onWeakTopic: (subjectId: string, topic: string, source: string, delta?: number) => void }) {
+function FlashcardPanel({ data, activeSubject, updateData, onWeakTopic }: { data: ExamPilotData; activeSubject?: Subject; updateData: (updater: (current: ExamPilotData) => ExamPilotData) => void; onWeakTopic: (subjectId: string, topic: string, source: string, delta?: number) => void }) {
   const [topic, setTopic] = useState('');
   const [question, setQuestion] = useState('');
   const [answer, setAnswer] = useState('');
-  const cards = data.flashcards.filter((card) => card.subjectId === subject.id);
+  const [filter, setFilter] = useState<'due' | 'overdue' | 'all'>('due');
+  const [topicFilter, setTopicFilter] = useState('');
+  const [settings, setSettings] = useState<FlashcardSettings>('definitions');
+
+  const scopedCards = data.flashcards
+    .filter((card) => !activeSubject || card.subjectId === activeSubject.id)
+    .filter((card) => !topicFilter || card.topic.toLowerCase().includes(topicFilter.toLowerCase()))
+    .filter((card) => filter === 'all' || (filter === 'due' ? card.nextReview <= today() : card.nextReview < today()));
+  const reviewCard = scopedCards[0];
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (!reviewCard || !['1', '2', '3', '4'].includes(event.key)) return;
+      const shortcuts: Record<string, FlashcardDifficulty> = { '1': 'Again', '2': 'Hard', '3': 'Good', '4': 'Easy' };
+      const difficulty = shortcuts[event.key];
+      if (!difficulty) return;
+      review(reviewCard, difficulty);
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  });
 
   const addCard = (event: FormEvent) => {
     event.preventDefault();
-    if (!question.trim() || !answer.trim()) return;
+    if (!question.trim() || !answer.trim() || !activeSubject) return;
     updateData((current) => ({
       ...current,
-      flashcards: [{ id: newId('card'), subjectId: subject.id, topic: topic || 'General', question, answer, difficulty: 'Good', nextReview: today(), createdAt: new Date().toISOString() }, ...current.flashcards],
+      flashcards: [{ id: newId('card'), subjectId: activeSubject.id, topic: topic || settings, question, answer, difficulty: 'Good', nextReview: today(), createdAt: new Date().toISOString() }, ...current.flashcards],
     }));
     setQuestion('');
     setAnswer('');
@@ -512,64 +847,134 @@ function FlashcardPanel({ data, subject, updateData, onWeakTopic }: { data: Exam
   };
 
   const generate = async () => {
-    const guidance = data.guidance.filter((item) => item.subjectId === subject.id).map((item) => item.content).join('\n');
-    const cards = await generateFlashcards(subject, guidance, data);
+    if (!activeSubject) return;
+    const guidance = [
+      `Generate ${settings} flashcards.`,
+      ...data.guidance.filter((item) => item.subjectId === activeSubject.id).map((item) => item.content),
+    ].join('\n');
+    const cards = await generateFlashcards(activeSubject, guidance, data);
     updateData((current) => ({ ...current, flashcards: [...cards, ...current.flashcards] }));
   };
 
-  const review = (id: string, difficulty: FlashcardDifficulty, cardTopic: string) => {
+  const review = (card: Flashcard, difficulty: FlashcardDifficulty) => {
     const days = { Again: 1, Hard: 2, Good: 5, Easy: 9 }[difficulty];
     const next = new Date();
     next.setDate(next.getDate() + days);
-    if (difficulty === 'Again' || difficulty === 'Hard') onWeakTopic(subject.id, cardTopic, 'flashcard review', difficulty === 'Again' ? 2 : 1);
+    if (difficulty === 'Again' || difficulty === 'Hard') onWeakTopic(card.subjectId, card.topic, 'flashcard review', difficulty === 'Again' ? 2 : 1);
     updateData((current) => ({
       ...current,
-      flashcards: current.flashcards.map((card) =>
-        card.id === id ? { ...card, difficulty, lastReviewed: new Date().toISOString(), nextReview: next.toISOString().slice(0, 10) } : card,
+      flashcards: current.flashcards.map((item) =>
+        item.id === card.id ? { ...item, difficulty, lastReviewed: new Date().toISOString(), nextReview: next.toISOString().slice(0, 10) } : item,
       ),
     }));
   };
 
+  const exportCards = () => {
+    const blob = new Blob([JSON.stringify(scopedCards, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `exampilot-flashcards-${today()}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   return (
-    <Panel title="Flashcards" subtitle={`${subject.name}: create cards manually or generate from saved guidance.`}>
-      <div className="mb-4 flex justify-end">
-        <button className="btn-primary" onClick={generate}><Sparkles size={17} /> Generate from guidance</button>
+    <div className="space-y-5">
+      <PageHeader
+        eyebrow="Flashcards"
+        title="Review queue"
+        subtitle="Due filters, topic targeting, keyboard shortcuts, and AI card-generation modes."
+        action={<button className="btn-primary" onClick={generate}><Sparkles size={16} /> Generate {settings}</button>}
+      />
+
+      <div className="grid gap-4 xl:grid-cols-[1fr_0.9fr]">
+        <section className="panel">
+          <div className="section-line">
+            <SectionTitle icon={<Keyboard size={17} />} title="Review interface" />
+            <span className="muted">1 Again · 2 Hard · 3 Good · 4 Easy</span>
+          </div>
+          {reviewCard ? (
+            <div className="review-card">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="pill">{subjectName(data, reviewCard.subjectId)}</span>
+                <span className="pill">{reviewCard.topic}</span>
+                <span className="pill">due {reviewCard.nextReview}</span>
+              </div>
+              <h3>{reviewCard.question}</h3>
+              <p>{reviewCard.answer}</p>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                {(['Again', 'Hard', 'Good', 'Easy'] as FlashcardDifficulty[]).map((item) => (
+                  <button key={item} className="btn-secondary justify-center" onClick={() => review(reviewCard, item)}>{item}</button>
+                ))}
+              </div>
+            </div>
+          ) : <EmptyState title="No cards in this queue" body="Change the filter or generate cards from current guidance." />}
+        </section>
+
+        <section className="panel">
+          <SectionTitle icon={<Sparkles size={17} />} title="Generation settings" />
+          <div className="mt-4 grid grid-cols-2 gap-2">
+            {(['definitions', 'exam questions', 'dates', 'formulas', 'vocab', 'essay evidence'] as FlashcardSettings[]).map((item) => (
+              <button key={item} className={`chip ${settings === item ? 'chip-active' : ''}`} onClick={() => setSettings(item)}>{item}</button>
+            ))}
+          </div>
+          <form className="mt-4 space-y-3" onSubmit={addCard}>
+            <input className="input" value={topic} onChange={(event) => setTopic(event.target.value)} placeholder="Topic" />
+            <input className="input" value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Question" />
+            <textarea className="input min-h-20" value={answer} onChange={(event) => setAnswer(event.target.value)} placeholder="Answer" />
+            <button className="btn-secondary w-full justify-center" disabled={!activeSubject}><Plus size={16} /> Add card</button>
+          </form>
+        </section>
       </div>
-      <form className="grid gap-3 lg:grid-cols-[180px_1fr_1fr_auto]" onSubmit={addCard}>
-        <input className="input" value={topic} onChange={(event) => setTopic(event.target.value)} placeholder="Topic" />
-        <input className="input" value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Question" />
-        <input className="input" value={answer} onChange={(event) => setAnswer(event.target.value)} placeholder="Answer" />
-        <button className="btn-secondary"><Plus size={17} /> Add</button>
-      </form>
-      <div className="mt-5 grid gap-3 xl:grid-cols-2">
-        {cards.length ? cards.map((card) => (
-          <article key={card.id} className="rounded-lg border border-slate-200 bg-white p-4">
-            <div className="flex items-center justify-between gap-2">
+
+      <section className="panel">
+        <div className="section-line">
+          <div className="flex flex-wrap gap-2">
+            {(['due', 'overdue', 'all'] as const).map((item) => <button key={item} className={`chip ${filter === item ? 'chip-active' : ''}`} onClick={() => setFilter(item)}>{item}</button>)}
+            <input className="input h-9 w-48" value={topicFilter} onChange={(event) => setTopicFilter(event.target.value)} placeholder="Filter topic" />
+          </div>
+          <button className="btn-secondary" onClick={exportCards}><Download size={16} /> Export cards</button>
+        </div>
+        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {scopedCards.length ? scopedCards.slice(0, 18).map((card) => (
+            <div key={card.id} className="flashcard-tile">
               <span className="pill">{card.topic}</span>
-              <span className="text-xs text-slate-500">Next: {card.nextReview}</span>
+              <h3>{card.question}</h3>
+              <p>{card.answer}</p>
             </div>
-            <h3 className="mt-3 font-semibold">{card.question}</h3>
-            <p className="mt-2 text-sm text-slate-600">{card.answer}</p>
-            <div className="mt-4 grid grid-cols-4 gap-2">
-              {(['Again', 'Hard', 'Good', 'Easy'] as FlashcardDifficulty[]).map((item) => (
-                <button key={item} className="btn-compact" onClick={() => review(card.id, item, card.topic)}>{item}</button>
-              ))}
-            </div>
-          </article>
-        )) : <EmptyState title="No flashcards yet" body="Turn missed marks and guidance into cards. Due dates will stay honest." />}
-      </div>
-    </Panel>
+          )) : <EmptyState title="No matching cards" body="Use AI generation settings or add one manually." />}
+        </div>
+      </section>
+    </div>
   );
 }
 
-function ExamExpertPanel({ data, activeSubject, activeSubjectId, setActiveSubjectId, updateData }: { data: ExamPilotData; activeSubject?: Subject; activeSubjectId: string; setActiveSubjectId: (id: string) => void; updateData: (updater: (current: ExamPilotData) => ExamPilotData) => void }) {
+function ExamExpertPanel({
+  data,
+  activeSubject,
+  activeSubjectId,
+  setActiveSubjectId,
+  updateData,
+  aiStatus,
+  onWeakTopic,
+}: {
+  data: ExamPilotData;
+  activeSubject?: Subject;
+  activeSubjectId: string;
+  setActiveSubjectId: (id: string) => void;
+  updateData: (updater: (current: ExamPilotData) => ExamPilotData) => void;
+  aiStatus: AIBackendStatus;
+  onWeakTopic: (subjectId: string, topic: string, source: string, delta?: number) => void;
+}) {
   const [question, setQuestion] = useState('');
   const subjectMessages = data.aiMessages.filter((message) => !activeSubjectId || message.subjectId === activeSubjectId || !message.subjectId);
-  const ask = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!question.trim()) return;
-    const user: AIMessage = { id: newId('message'), role: 'user', content: question, createdAt: new Date().toISOString(), subjectId: activeSubjectId };
-    const response = await askExamExpert(question, activeSubject, data);
+  const latestAssistant = [...subjectMessages].reverse().find((message) => message.role === 'assistant');
+
+  const ask = async (prompt = question) => {
+    if (!prompt.trim()) return;
+    const user: AIMessage = { id: newId('message'), role: 'user', content: prompt, createdAt: new Date().toISOString(), subjectId: activeSubjectId };
+    const response = await askExamExpert(prompt, activeSubject, data);
     const assistant: AIMessage = {
       id: newId('message'),
       role: 'assistant',
@@ -582,38 +987,92 @@ function ExamExpertPanel({ data, activeSubject, activeSubjectId, setActiveSubjec
     setQuestion('');
   };
 
+  const turnAnswerIntoCards = async () => {
+    if (!latestAssistant || !activeSubject) return;
+    const cards = await generateFlashcards(activeSubject, latestAssistant.content, data);
+    updateData((current) => ({ ...current, flashcards: [...cards, ...current.flashcards] }));
+  };
+
+  const turnWeakIntoSession = () => {
+    const weak = data.weakTopics.find((topic) => !activeSubject || topic.subjectId === activeSubject.id);
+    const subject = activeSubject ?? data.subjects.find((item) => item.id === weak?.subjectId);
+    if (!weak || !subject) return;
+    updateData((current) => ({
+      ...current,
+      sessions: [{
+        id: newId('session'),
+        subjectId: subject.id,
+        title: `${subject.name}: ${weak.topic}`,
+        type: 'revision',
+        date: today(),
+        startTime: '19:30',
+        durationMinutes: 40,
+        mode: 'Normal',
+        status: 'planned',
+        topic: weak.topic,
+        reason: 'Created from weak-topic AI action.',
+      }, ...current.sessions],
+    }));
+  };
+
   return (
-    <Panel title="Exam Expert AI" subtitle="Answers use the serverless AI backend when configured, with local fallback kept available. Context is shown openly.">
-      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center">
-        <select className="input sm:w-72" value={activeSubjectId} onChange={(event) => setActiveSubjectId(event.target.value)}>
-          <option value="">All subjects</option>
-          {data.subjects.map((subject) => <option key={subject.id} value={subject.id}>{subject.name}</option>)}
-        </select>
-        <span className="text-sm text-slate-600">Using: {activeSubject ? `${activeSubject.name} · exam ${activeSubject.examDate}` : 'all stored revision context'}</span>
-      </div>
-      <div className="max-h-[460px] space-y-3 overflow-y-auto rounded-lg border border-slate-200 bg-slate-50 p-3">
-        {subjectMessages.length ? subjectMessages.map((message) => (
-          <div key={message.id} className={`chat ${message.role === 'assistant' ? 'chat-ai' : 'chat-user'}`}>
-            {message.contextSummary && <p className="mb-1 text-xs font-medium text-slate-500">Context: {message.contextSummary}</p>}
-            <p className="whitespace-pre-wrap text-sm">{message.content}</p>
+    <div className="space-y-5">
+      <PageHeader
+        eyebrow="Exam Expert AI"
+        title="Context-aware revision assistant"
+        subtitle="Uses stored guidance, exam dates, weak topics, flashcards, sessions, and the selected subject."
+        action={<AIStatusPill status={aiStatus} />}
+      />
+      <div className="grid gap-4 xl:grid-cols-[0.8fr_1.2fr]">
+        <section className="panel">
+          <SectionTitle icon={<CircleDot size={17} />} title="Context controls" />
+          <select className="input mt-4" value={activeSubjectId} onChange={(event) => setActiveSubjectId(event.target.value)}>
+            <option value="">All subjects</option>
+            {data.subjects.map((subject) => <option key={subject.id} value={subject.id}>{subject.name}</option>)}
+          </select>
+          <div className="mt-4 space-y-2">
+            <QuickPrompt text="Make me a 16-mark essay plan." onClick={() => ask('Make me a 16-mark essay plan using my stored guidance.')} />
+            <QuickPrompt text="Generate mark scheme bullet points." onClick={() => ask('Generate mark scheme bullet points for my weakest current topic.')} />
+            <QuickPrompt text="Test me on this subject." onClick={() => ask('Test me on the most important weak area for this subject.')} />
+            <QuickPrompt text="Create tonight’s revision strategy." onClick={() => ask('What should I revise tonight, and why?')} />
           </div>
-        )) : <EmptyState title="Ask a revision question" body="Try an essay plan, a simple explanation, a test prompt, or a targeted topic strategy." />}
+          <div className="mt-4 grid gap-2">
+            <button className="btn-secondary justify-center" onClick={turnAnswerIntoCards} disabled={!latestAssistant || !activeSubject}><BookOpen size={16} /> Turn answer into flashcards</button>
+            <button className="btn-secondary justify-center" onClick={turnWeakIntoSession}><CalendarDays size={16} /> Turn weak topic into session</button>
+            <button className="btn-secondary justify-center" onClick={() => activeSubject && generatePracticeQuestions(activeSubject, data.weakTopics.find((topic) => topic.subjectId === activeSubject.id)?.topic || 'priority topic', data).then((questions) => updateData((current) => ({ ...current, practiceQuestions: [...questions, ...current.practiceQuestions] })))} disabled={!activeSubject}><Brain size={16} /> Quiz from guidance</button>
+          </div>
+        </section>
+
+        <section className="panel">
+          <div className="chat-window">
+            {subjectMessages.length ? subjectMessages.map((message) => (
+              <div key={message.id} className={`chat ${message.role === 'assistant' ? 'chat-ai' : 'chat-user'}`}>
+                {message.contextSummary && <p className="mb-1 text-xs font-medium text-stone-500">Context used: {message.contextSummary}</p>}
+                <p className="whitespace-pre-wrap text-sm leading-6">{message.content}</p>
+              </div>
+            )) : <EmptyState title="Ask a revision question" body="Try an essay plan, simple explanation, self-test, mark scheme, or topic strategy." />}
+          </div>
+          <form className="mt-4 flex flex-col gap-2 sm:flex-row" onSubmit={(event) => { event.preventDefault(); ask(); }}>
+            <input className="input" value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="How should I revise Chemistry acids?" />
+            <button className="btn-primary"><MessageSquareText size={16} /> Ask</button>
+          </form>
+        </section>
       </div>
-      <form className="mt-4 flex gap-2" onSubmit={ask}>
-        <input className="input" value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="How should I revise Chemistry acids?" />
-        <button className="btn-primary"><MessageSquareText size={17} /> Ask</button>
-      </form>
-    </Panel>
+    </div>
   );
 }
 
 function PracticePanel({ data, subject, updateData, onWeakTopic }: { data: ExamPilotData; subject: Subject; updateData: (updater: (current: ExamPilotData) => ExamPilotData) => void; onWeakTopic: (subjectId: string, topic: string, source: string, delta?: number) => void }) {
   const [topic, setTopic] = useState('');
+  const [mode, setMode] = useState<'mixed' | 'essay' | 'mark scheme' | 'french vocab' | 'formula/definition'>('mixed');
   const questions = data.practiceQuestions.filter((question) => question.subjectId === subject.id);
+
   const generate = async () => {
-    const created = await generatePracticeQuestions(subject, topic || data.weakTopics.find((weak) => weak.subjectId === subject.id)?.topic || 'priority topic', data);
+    const baseTopic = topic || data.weakTopics.find((weak) => weak.subjectId === subject.id)?.topic || 'priority topic';
+    const created = await generatePracticeQuestions(subject, `${baseTopic} (${mode})`, data);
     updateData((current) => ({ ...current, practiceQuestions: [...created, ...current.practiceQuestions] }));
   };
+
   const mark = (id: string, result: PracticeResult, questionTopic: string) => {
     if (result !== 'correct') onWeakTopic(subject.id, questionTopic, 'practice mistake', result === 'incorrect' ? 3 : 1);
     updateData((current) => ({
@@ -621,84 +1080,415 @@ function PracticePanel({ data, subject, updateData, onWeakTopic }: { data: ExamP
       practiceQuestions: current.practiceQuestions.map((question) => (question.id === id ? { ...question, result } : question)),
     }));
   };
+
+  const mistakes = questions.filter((question) => question.result === 'partial' || question.result === 'incorrect');
+
   return (
-    <Panel title="Practice Mode" subtitle={`${subject.name}: quick quizzes, definitions, short answers, exam-style prompts, and essay planning.`}>
-      <div className="mb-4 flex flex-col gap-3 sm:flex-row">
-        <input className="input" value={topic} onChange={(event) => setTopic(event.target.value)} placeholder="Topic to practise" />
-        <button className="btn-primary" onClick={generate}><Sparkles size={17} /> Generate quiz</button>
-      </div>
-      <div className="space-y-3">
-        {questions.length ? questions.map((question) => (
-          <article key={question.id} className="rounded-lg border border-slate-200 bg-white p-4">
-            <div className="flex flex-wrap gap-2">
-              <span className="pill">{question.type}</span>
-              <span className="pill">{question.topic}</span>
-              {question.result && <span className="pill">{question.result}</span>}
-            </div>
-            <h3 className="mt-3 font-semibold">{question.prompt}</h3>
-            {question.options && <div className="mt-2 grid gap-2 sm:grid-cols-2">{question.options.map((option) => <p key={option} className="rounded-md bg-slate-100 p-2 text-sm">{option}</p>)}</div>}
-            <p className="mt-3 text-sm text-slate-600">Answer guide: {question.answerGuide}</p>
-            {question.explanation && <p className="mt-2 text-sm text-slate-600">Explanation: {question.explanation}</p>}
-            {question.markSchemePoints?.length ? (
-              <div className="mt-3 rounded-md bg-slate-100 p-3">
-                <p className="text-xs font-semibold uppercase tracking-normal text-slate-500">Mark-scheme points</p>
-                <ul className="mt-2 space-y-1 text-sm text-slate-600">
-                  {question.markSchemePoints.map((point) => <li key={point}>• {point}</li>)}
-                </ul>
+    <div className="space-y-5">
+      <PageHeader
+        eyebrow="Practice mode"
+        title={`${subject.name} question bank`}
+        subtitle="Generate exam-style questions, essay plans, mark schemes, vocab drills, and formula or definition checks."
+        action={<button className="btn-primary" onClick={generate}><Sparkles size={16} /> Generate</button>}
+      />
+
+      <section className="panel">
+        <div className="grid gap-3 lg:grid-cols-[1fr_auto]">
+          <input className="input" value={topic} onChange={(event) => setTopic(event.target.value)} placeholder="Topic to practise" />
+          <div className="flex flex-wrap gap-2">
+            {(['mixed', 'essay', 'mark scheme', 'french vocab', 'formula/definition'] as const).map((item) => (
+              <button key={item} className={`chip ${mode === item ? 'chip-active' : ''}`} onClick={() => setMode(item)}>{item}</button>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      <div className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
+        <section className="panel">
+          <SectionTitle icon={<Brain size={17} />} title="Exam-style question bank" />
+          <div className="mt-4 space-y-3">
+            {questions.length ? questions.map((question) => (
+              <article key={question.id} className="question-card">
+                <div className="flex flex-wrap gap-2">
+                  <span className="pill">{question.type}</span>
+                  <span className="pill">{question.topic}</span>
+                  {question.result && <span className="pill">{question.result}</span>}
+                </div>
+                <h3>{question.prompt}</h3>
+                {question.options?.length ? <div className="grid gap-2 sm:grid-cols-2">{question.options.map((option) => <p key={option} className="option-line">{option}</p>)}</div> : null}
+                <p className="muted">Answer guide: {question.answerGuide}</p>
+                {question.explanation && <p className="muted">Explanation: {question.explanation}</p>}
+                {question.markSchemePoints?.length ? <BulletList title="Mark scheme" items={question.markSchemePoints} /> : null}
+                <div className="flex flex-wrap gap-2">
+                  {(['correct', 'partial', 'incorrect'] as PracticeResult[]).map((result) => (
+                    <button key={result} className="btn-secondary" onClick={() => mark(question.id, result, question.topic)}>{result}</button>
+                  ))}
+                </div>
+              </article>
+            )) : <EmptyState title="No practice attempts yet" body="Generate a question set from a weak topic or pasted guidance." />}
+          </div>
+        </section>
+
+        <section className="panel">
+          <SectionTitle icon={<AlertTriangle size={17} />} title="Mistake log" />
+          <div className="mt-4 space-y-3">
+            {mistakes.length ? mistakes.map((question) => (
+              <div key={question.id} className="mistake-card">
+                <h3>{question.topic}</h3>
+                <p>{question.prompt}</p>
+                <span className="pill">{question.result}</span>
               </div>
-            ) : null}
-            <div className="mt-4 flex flex-wrap gap-2">
-              {(['correct', 'partial', 'incorrect'] as PracticeResult[]).map((result) => (
-                <button key={result} className="btn-secondary" onClick={() => mark(question.id, result, question.topic)}>{result}</button>
-              ))}
-            </div>
-          </article>
-        )) : <EmptyState title="No practice attempts yet" body="Generate questions from a topic, then mark honestly. Mistakes become weak-topic signals." />}
+            )) : <EmptyState title="No mistakes logged" body="Mark answers honestly. Partial and incorrect responses feed weak-topic tracking." compact />}
+          </div>
+        </section>
       </div>
-    </Panel>
+    </div>
+  );
+}
+
+function DailyReviewPanel({ data, analytics, nextBlock, onTonight, onView }: { data: ExamPilotData; analytics: ReturnType<typeof getAnalytics>; nextBlock?: NextBlock; onTonight: () => void; onView: (view: View) => void }) {
+  return (
+    <div className="space-y-5">
+      <PageHeader
+        eyebrow="Daily review"
+        title="Close the loop before tomorrow"
+        subtitle="A short evening review: recover missed work, clear due cards, and schedule one specific next block."
+        action={<button className="btn-primary" onClick={onTonight}><Moon size={16} /> Ask tonight</button>}
+      />
+      <div className="grid gap-4 md:grid-cols-3">
+        <ReviewStep title="1. Clear retrieval" body={`${analytics.dueCards} flashcards due. Start with the smallest honest queue.`} action="Review cards" onClick={() => onView('Flashcards')} />
+        <ReviewStep title="2. Recover misses" body={`${analytics.skippedSessions} skipped sessions. Replace one with a smaller block.`} action="Open timetable" onClick={() => onView('Timetable')} />
+        <ReviewStep title="3. Choose next block" body={nextBlock?.title ?? 'Add a subject or weak topic to generate a next action.'} action="Dashboard" onClick={() => onView('Dashboard')} />
+      </div>
+      <FocusMode />
+      <section className="panel">
+        <SectionTitle icon={<ListChecks size={17} />} title="Daily checklist" />
+        <div className="mt-4 grid gap-2 md:grid-cols-2">
+          {[
+            'Review due cards before opening notes',
+            'Do one exam-style question for the weakest topic',
+            'Mark strictly with bullet-point evidence',
+            'Schedule a recovery block if anything was skipped',
+            'Update confidence after practice',
+            'Stop with one clear first task for tomorrow',
+          ].map((item) => <label key={item} className="check-row"><input type="checkbox" /> <span>{item}</span></label>)}
+        </div>
+      </section>
+    </div>
   );
 }
 
 function AnalyticsPanel({ data, analytics }: { data: ExamPilotData; analytics: ReturnType<typeof getAnalytics> }) {
+  const bySubject = data.subjects.map((subject) => ({
+    subject,
+    minutes: data.sessions.filter((session) => session.subjectId === subject.id && session.status === 'done').reduce((sum, session) => sum + session.durationMinutes, 0),
+  }));
+  const flashAccuracy = analytics.reviewedCards ? Math.round((analytics.goodCards / analytics.reviewedCards) * 100) : 0;
+
   return (
-    <Panel title="Progress and Analytics" subtitle="Honest signals only: no invented streaks, no fake mastery.">
-      <div className="grid gap-4 md:grid-cols-4">
-        <Metric label="Total revision time" value={`${analytics.revisionHours}h`} />
-        <Metric label="Sessions completed" value={analytics.sessionsCompleted} />
-        <Metric label="Flashcards due" value={analytics.dueCards} />
-        <Metric label="Weak topics" value={data.weakTopics.length} />
+    <div className="space-y-5">
+      <PageHeader eyebrow="Analytics" title="Honest progress signals" subtitle="No fake streaks, no inflated mastery. These numbers come from what you actually logged." />
+      <div className="grid gap-4 md:grid-cols-5">
+        <MetricCard label="Study streak" value={`${analytics.streak}d`} sub="completed sessions" />
+        <MetricCard label="Readiness" value={`${analytics.readiness}%`} sub="exam estimate" />
+        <MetricCard label="Flashcard accuracy" value={`${flashAccuracy}%`} sub={`${analytics.reviewedCards} reviewed`} />
+        <MetricCard label="Completed" value={analytics.sessionsCompleted} sub={`${analytics.skippedSessions} skipped`} />
+        <MetricCard label="Revision time" value={`${analytics.revisionHours}h`} sub="total done" />
       </div>
-      <div className="mt-5 grid gap-4 lg:grid-cols-3">
-        <div className="card-flat lg:col-span-2">
-          <h3 className="section-title">Confidence by Subject</h3>
+      <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+        <section className="panel">
+          <SectionTitle icon={<BarChart3 size={17} />} title="Revision time by subject" />
+          <div className="mt-4 space-y-4">
+            {bySubject.length ? bySubject.map(({ subject, minutes }) => (
+              <ProgressRow key={subject.id} label={subject.name} value={`${Math.round(minutes / 6) / 10}h`} percent={Math.min(100, minutes / Math.max(1, analytics.maxSubjectMinutes) * 100)} colour={subject.colour} />
+            )) : <EmptyState title="No revision time yet" body="Mark sessions done to build time analytics." compact />}
+          </div>
+        </section>
+        <section className="panel">
+          <SectionTitle icon={<AlertTriangle size={17} />} title="Weakest topics" />
+          <div className="mt-4 space-y-2">
+            {data.weakTopics.length ? [...data.weakTopics].sort((a, b) => b.score - a.score).slice(0, 8).map((weak) => (
+              <CompactLine key={weak.id} title={`${subjectName(data, weak.subjectId)} · ${weak.topic}`} meta={`score ${weak.score} · ${weak.sources.join(', ')}`} />
+            )) : <EmptyState title="No weak topics" body="Practice mistakes and hard flashcards populate this." compact />}
+          </div>
+        </section>
+      </div>
+      <section className="panel">
+        <SectionTitle icon={<Target size={17} />} title="Confidence trend" />
+        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           {data.subjects.length ? data.subjects.map((subject) => (
-            <div key={subject.id} className="mt-4">
-              <div className="mb-1 flex justify-between text-sm"><span>{subject.name}</span><span>{subject.confidence}/5</span></div>
-              <div className="h-2 rounded-full bg-slate-200"><div className="h-2 rounded-full" style={{ width: `${subject.confidence * 20}%`, background: subject.colour }} /></div>
+            <div key={subject.id} className="trend-card">
+              <div className="flex items-center justify-between">
+                <h3>{subject.name}</h3>
+                <span>{subject.confidence}/5</span>
+              </div>
+              <div className="sparkline" style={{ background: `linear-gradient(90deg, ${subject.colour} ${subject.confidence * 20}%, #e7e5e4 ${subject.confidence * 20}%)` }} />
+              <p>Current confidence snapshot. Future imports can preserve dated trend points.</p>
             </div>
-          )) : <EmptyState title="No confidence data" body="Add subjects to see honest confidence tracking." />}
+          )) : <EmptyState title="No subjects" body="Add a subject to begin confidence tracking." compact />}
         </div>
-        <div className="card-flat">
-          <h3 className="section-title">Weakest Topics</h3>
-          {data.weakTopics.length ? [...data.weakTopics].sort((a, b) => b.score - a.score).slice(0, 6).map((weak) => (
-            <p key={weak.id} className="mt-3 rounded-md bg-slate-100 p-3 text-sm">{subjectName(data, weak.subjectId)} · {weak.topic} · score {weak.score}</p>
-          )) : <EmptyState title="No weak topics logged" body="Practice mistakes, hard flashcards, and AI analysis will populate this." />}
-        </div>
-      </div>
-    </Panel>
+      </section>
+    </div>
   );
 }
 
-function SubjectSummary({ subject }: { subject: Subject }) {
+function SubjectForm({ onAdd, compact = false }: { onAdd: (subject: Subject) => void; compact?: boolean }) {
+  const [open, setOpen] = useState(!compact);
+  const [name, setName] = useState('');
+  const [examDate, setExamDate] = useState(today());
+  const [priority, setPriority] = useState<PriorityLevel>('Medium');
+  const [confidence, setConfidence] = useState<ConfidenceLevel>(3);
+  const [colour, setColour] = useState(swatches[0]);
+  const [notes, setNotes] = useState('');
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (!name.trim()) return;
+    onAdd({ id: newId('subject'), name: name.trim(), examDate, priority, confidence, colour, notes, createdAt: new Date().toISOString() });
+    setName('');
+    setNotes('');
+    if (compact) setOpen(false);
+  };
+
+  if (compact && !open) {
+    return <button className="btn-secondary w-full justify-center" onClick={() => setOpen(true)}><Plus size={15} /> Add subject</button>;
+  }
+
   return (
-    <div className="rounded-lg border border-slate-200 bg-white p-4">
-      <div className="flex items-center gap-3">
-        <span className="h-10 w-2 rounded-full" style={{ background: subject.colour }} />
-        <div>
-          <h3 className="font-semibold">{subject.name}</h3>
-          <p className="text-sm text-slate-600">{daysUntil(subject.examDate)} days until exam · {subject.priority} priority · confidence {subject.confidence}/5</p>
-        </div>
+    <form className={compact ? 'compact-subject-form' : 'panel space-y-3'} onSubmit={submit}>
+      <div className="section-line">
+        <span className="sidebar-heading">Add subject</span>
+        {compact && <button type="button" className="tiny-button" onClick={() => setOpen(false)}>Close</button>}
       </div>
+      <input className="input" value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Chemistry" />
+      <input className="input" type="date" value={examDate} onChange={(event) => setExamDate(event.target.value)} />
+      <div className="grid grid-cols-2 gap-2">
+        <select className="input" value={priority} onChange={(event) => setPriority(event.target.value as PriorityLevel)}>
+          {priorities.map((item) => <option key={item}>{item}</option>)}
+        </select>
+        <select className="input" value={confidence} onChange={(event) => setConfidence(Number(event.target.value) as ConfidenceLevel)}>
+          {[1, 2, 3, 4, 5].map((item) => <option key={item} value={item}>{item}/5</option>)}
+        </select>
+      </div>
+      <div className="flex gap-2">
+        {swatches.map((swatch) => (
+          <button type="button" title={swatch} key={swatch} className={`swatch ${colour === swatch ? 'swatch-active' : ''}`} style={{ background: swatch }} onClick={() => setColour(swatch)} />
+        ))}
+      </div>
+      <textarea className="input min-h-16" value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="Notes, risks, teacher advice" />
+      <button className="btn-primary w-full justify-center"><Plus size={15} /> Save subject</button>
+    </form>
+  );
+}
+
+function FocusMode() {
+  const [minutes, setMinutes] = useState(25);
+  const [secondsLeft, setSecondsLeft] = useState(25 * 60);
+  const [running, setRunning] = useState(false);
+
+  useEffect(() => {
+    if (!running) return;
+    const timer = window.setInterval(() => setSecondsLeft((value) => Math.max(0, value - 1)), 1000);
+    return () => window.clearInterval(timer);
+  }, [running]);
+
+  useEffect(() => {
+    if (secondsLeft === 0) setRunning(false);
+  }, [secondsLeft]);
+
+  const reset = (value = minutes) => {
+    setMinutes(value);
+    setSecondsLeft(value * 60);
+    setRunning(false);
+  };
+
+  return (
+    <section className="panel focus-panel">
+      <div>
+        <p className="eyebrow">Focus mode</p>
+        <h3>Pomodoro timer</h3>
+        <p>Use this for one clearly scoped revision block, then log the result honestly.</p>
+      </div>
+      <div className="timer-face">{formatTimer(secondsLeft)}</div>
+      <div className="flex flex-wrap gap-2">
+        {[25, 45, 60].map((value) => <button key={value} className={`chip ${minutes === value ? 'chip-active' : ''}`} onClick={() => reset(value)}>{value}m</button>)}
+        <button className="btn-primary" onClick={() => setRunning((value) => !value)}>{running ? <Pause size={16} /> : <Play size={16} />}{running ? 'Pause' : 'Start'}</button>
+        <button className="btn-secondary" onClick={() => reset()}><TimerReset size={16} /> Reset</button>
+      </div>
+    </section>
+  );
+}
+
+function MobileNav({ activeView, onView }: { activeView: View; onView: (view: View) => void }) {
+  const mobileItems: Array<[View, ReactNode]> = [
+    ['Dashboard', <Target size={18} />],
+    ['Subject', <Layers3 size={18} />],
+    ['Timetable', <CalendarDays size={18} />],
+    ['Flashcards', <BookOpen size={18} />],
+    ['AI', <MessageSquareText size={18} />],
+  ];
+  return (
+    <nav className="mobile-nav">
+      {mobileItems.map(([view, icon]) => <button key={view} className={activeView === view ? 'mobile-active' : ''} onClick={() => onView(view)}>{icon}<span>{view === 'Flashcards' ? 'Cards' : view}</span></button>)}
+    </nav>
+  );
+}
+
+function PageHeader({ eyebrow, title, subtitle, action }: { eyebrow: string; title: string; subtitle: string; action?: ReactNode }) {
+  return (
+    <div className="page-header">
+      <div>
+        <p className="eyebrow">{eyebrow}</p>
+        <h2>{title}</h2>
+        <p>{subtitle}</p>
+      </div>
+      {action}
+    </div>
+  );
+}
+
+function Panel({ eyebrow, title, subtitle, children }: { eyebrow?: string; title: string; subtitle?: string; children: ReactNode }) {
+  return (
+    <section className="panel">
+      <div className="mb-5">
+        {eyebrow && <p className="eyebrow">{eyebrow}</p>}
+        <h2 className="section-heading">{title}</h2>
+        {subtitle && <p className="muted mt-1">{subtitle}</p>}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function SectionTitle({ icon, title }: { icon: ReactNode; title: string }) {
+  return <div className="section-title">{icon}<span>{title}</span></div>;
+}
+
+function AIStatusPill({ status }: { status: AIBackendStatus }) {
+  const copy = status === 'real' ? 'Real AI' : status === 'mock' ? 'Mock fallback' : status === 'error' ? 'AI error' : 'AI ready';
+  return <span className={`ai-pill ai-${status}`}><span />{copy}</span>;
+}
+
+function MetricCard({ label, value, sub }: { label: string; value: string | number; sub: string }) {
+  return (
+    <div className="metric-card">
+      <p>{label}</p>
+      <strong>{value}</strong>
+      <span>{sub}</span>
+    </div>
+  );
+}
+
+function MiniStat({ label, value, dark = false }: { label: string; value: string | number; dark?: boolean }) {
+  return <div className={dark ? 'mini-stat mini-stat-dark' : 'mini-stat'}><span>{label}</span><strong>{value}</strong></div>;
+}
+
+function EmptyState({ title, body, compact = false }: { title: string; body: string; compact?: boolean }) {
+  return (
+    <div className={`empty-state ${compact ? 'empty-compact' : ''}`}>
+      <Clock3 size={compact ? 18 : 22} />
+      <h3>{title}</h3>
+      <p>{body}</p>
+    </div>
+  );
+}
+
+function SubjectPriorityCard({ data, subject, onOpen }: { data: ExamPilotData; subject: Subject; onOpen: () => void }) {
+  const weak = data.weakTopics.filter((topic) => topic.subjectId === subject.id);
+  const due = data.flashcards.filter((card) => card.subjectId === subject.id && card.nextReview <= today()).length;
+  return (
+    <button className="subject-priority-card" onClick={onOpen}>
+      <span className="subject-colour" style={{ background: subject.colour }} />
+      <h3>{subject.name}</h3>
+      <p>{formatCountdown(subject.examDate)} · confidence {subject.confidence}/5</p>
+      <div className="flex gap-2">
+        <span className="pill">{subject.priority}</span>
+        <span className="pill">{weak.length} weak</span>
+        <span className="pill">{due} due</span>
+      </div>
+    </button>
+  );
+}
+
+function SubjectMiniPanel({ title, count, button, onClick, children }: { title: string; count: number; button: string; onClick: () => void; children: ReactNode }) {
+  return (
+    <section className="panel mini-panel">
+      <div className="section-line">
+        <div>
+          <h3>{title}</h3>
+          <p>{count} item{count === 1 ? '' : 's'}</p>
+        </div>
+        <button className="btn-secondary" onClick={onClick}>{button}</button>
+      </div>
+      <div className="mt-4 space-y-2">{children}</div>
+    </section>
+  );
+}
+
+function SessionRow({ session, subject }: { session: TimetableSession; subject?: Subject }) {
+  return (
+    <div className="session-row">
+      <span className="session-bar" style={{ background: subject?.colour ?? '#78716c' }} />
+      <div className="min-w-0 flex-1">
+        <h3>{session.title}</h3>
+        <p>{session.startTime} · {session.durationMinutes}m · {session.topic || session.type}</p>
+      </div>
+      <span className={`status-dot status-${session.status}`}>{session.status}</span>
+    </div>
+  );
+}
+
+function EditableSessionRow({ session, subject, onUpdate, onSkip, onDelete }: { session: TimetableSession; subject?: Subject; onUpdate: (id: string, patch: Partial<TimetableSession>) => void; onSkip: (session: TimetableSession) => void; onDelete: (id: string) => void }) {
+  return (
+    <div className="session-row editable-session">
+      <span className="session-bar" style={{ background: subject?.colour ?? '#78716c' }} />
+      <div className="min-w-0 flex-1">
+        <h3>{session.title}</h3>
+        <p>{session.date} · {session.startTime} · {session.durationMinutes}m</p>
+      </div>
+      <input className="input w-28" type="time" value={session.startTime} onChange={(event) => onUpdate(session.id, { startTime: event.target.value })} />
+      <button className="icon-button" title="Done" onClick={() => onUpdate(session.id, { status: 'done' })}><Check size={15} /></button>
+      <button className="icon-button" title="Skip and recover" onClick={() => onSkip(session)}><RotateCcw size={15} /></button>
+      <button className="icon-button" title="Delete" onClick={() => onDelete(session.id)}><Trash2 size={15} /></button>
+    </div>
+  );
+}
+
+function CalendarBlock({ session, subject }: { session: TimetableSession; subject?: Subject }) {
+  return (
+    <div className={`calendar-block calendar-${session.status}`}>
+      <span style={{ background: subject?.colour ?? '#78716c' }} />
+      <strong>{session.startTime}</strong>
+      <p>{session.title}</p>
+    </div>
+  );
+}
+
+function CompactLine({ title, meta }: { title: string; meta: string }) {
+  return <div className="compact-line"><h3>{title}</h3><p>{meta}</p></div>;
+}
+
+function PriorityLine({ text }: { text: string }) {
+  return <div className="priority-line"><AlertTriangle size={16} /><p>{text}</p></div>;
+}
+
+function QuickPrompt({ text, onClick }: { text: string; onClick: () => void }) {
+  return <button className="quick-prompt" onClick={onClick}>{text}<ChevronRight size={15} /></button>;
+}
+
+function BulletList({ title, items }: { title: string; items: string[] }) {
+  return (
+    <div className="bullet-box">
+      <p>{title}</p>
+      <ul>{items.map((item) => <li key={item}>{item}</li>)}</ul>
+    </div>
+  );
+}
+
+function AnalysisCompact({ analysis }: { analysis: NonNullable<import('./types').RevisionGuidance['analysis']> }) {
+  return (
+    <div className="space-y-2">
+      {analysis.keyTopics.slice(0, 4).map((topic) => <CompactLine key={topic} title={topic} meta="Extracted key topic" />)}
     </div>
   );
 }
@@ -713,53 +1503,38 @@ function AnalysisGrid({ analysis }: { analysis: NonNullable<import('./types').Re
     ['Likely weak areas', analysis.likelyWeakAreas],
   ];
   return (
-    <div className="mt-4 grid gap-3 lg:grid-cols-3">
+    <div className="analysis-grid">
       {sections.map(([title, items]) => (
-        <div key={String(title)} className="rounded-lg bg-slate-50 p-3">
-          <h4 className="text-sm font-semibold">{String(title)}</h4>
-          <ul className="mt-2 space-y-1 text-sm text-slate-600">
-            {(items as string[]).map((item) => <li key={item}>• {item}</li>)}
-          </ul>
+        <div key={String(title)}>
+          <h4>{String(title)}</h4>
+          <ul>{(items as string[]).slice(0, 6).map((item) => <li key={item}>{item}</li>)}</ul>
         </div>
       ))}
     </div>
   );
 }
 
-function Metric({ label, value }: { label: string; value: string | number }) {
+function ReviewStep({ title, body, action, onClick }: { title: string; body: string; action: string; onClick: () => void }) {
   return (
-    <div className="card-flat">
-      <p className="text-sm text-slate-500">{label}</p>
-      <p className="mt-2 text-2xl font-semibold">{value}</p>
+    <section className="panel review-step">
+      <h3>{title}</h3>
+      <p>{body}</p>
+      <button className="btn-secondary" onClick={onClick}>{action}</button>
+    </section>
+  );
+}
+
+function ProgressRow({ label, value, percent, colour }: { label: string; value: string; percent: number; colour: string }) {
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between text-sm"><span>{label}</span><span className="text-stone-500">{value}</span></div>
+      <div className="h-2 rounded-full bg-stone-200"><div className="h-2 rounded-full" style={{ width: `${percent}%`, background: colour }} /></div>
     </div>
   );
 }
 
-function Panel({ title, subtitle, children }: { title: string; subtitle: string; children: ReactNode }) {
-  return (
-    <div className="card">
-      <div className="mb-5">
-        <p className="eyebrow">ExamPilot</p>
-        <h2 className="text-2xl font-semibold tracking-tight">{title}</h2>
-        <p className="mt-1 text-sm text-slate-600">{subtitle}</p>
-      </div>
-      {children}
-    </div>
-  );
-}
-
-function EmptyState({ title, body }: { title: string; body: string }) {
-  return (
-    <div className="rounded-lg border border-dashed border-slate-300 bg-white/70 p-5 text-center">
-      <Clock3 className="mx-auto text-slate-400" size={24} />
-      <h3 className="mt-3 font-semibold">{title}</h3>
-      <p className="mt-1 text-sm text-slate-500">{body}</p>
-    </div>
-  );
-}
-
-function filterData(data: ExamPilotData, query: string) {
-  if (!query.trim()) return data;
+function filterSubjects(data: ExamPilotData, query: string) {
+  if (!query.trim()) return data.subjects;
   const q = query.toLowerCase();
   const subjectIds = new Set(data.subjects.filter((subject) => `${subject.name} ${subject.notes}`.toLowerCase().includes(q)).map((subject) => subject.id));
   data.guidance.forEach((item) => {
@@ -768,40 +1543,179 @@ function filterData(data: ExamPilotData, query: string) {
   data.flashcards.forEach((card) => {
     if (`${card.topic} ${card.question} ${card.answer}`.toLowerCase().includes(q)) subjectIds.add(card.subjectId);
   });
-  return { ...data, subjects: data.subjects.filter((subject) => subjectIds.has(subject.id)) };
+  data.weakTopics.forEach((topic) => {
+    if (topic.topic.toLowerCase().includes(q)) subjectIds.add(topic.subjectId);
+  });
+  return data.subjects.filter((subject) => subjectIds.has(subject.id));
+}
+
+function upsertWeakTopicInData(data: ExamPilotData, subjectId: string, topic: string, source: string, delta = 1): ExamPilotData {
+  const found = data.weakTopics.find((weak) => weak.subjectId === subjectId && weak.topic.toLowerCase() === topic.toLowerCase());
+  const weakTopics = found
+    ? data.weakTopics.map((weak) => weak.id === found.id ? { ...weak, score: Math.min(10, weak.score + delta), sources: Array.from(new Set([...weak.sources, source])), updatedAt: new Date().toISOString() } : weak)
+    : [...data.weakTopics, { id: newId('weak'), subjectId, topic, score: Math.max(1, delta), sources: [source], updatedAt: new Date().toISOString() }];
+  return { ...data, weakTopics };
 }
 
 function getAnalytics(data: ExamPilotData) {
-  const sessionsCompleted = data.sessions.filter((session) => session.status === 'done').length;
-  const revisionMinutes = data.sessions.filter((session) => session.status === 'done' && session.type === 'revision').reduce((total, session) => total + session.durationMinutes, 0);
+  const done = data.sessions.filter((session) => session.status === 'done');
+  const sessionsCompleted = done.length;
+  const skippedSessions = data.sessions.filter((session) => session.status === 'skipped').length;
+  const revisionMinutes = done.filter((session) => session.type === 'revision').reduce((total, session) => total + session.durationMinutes, 0);
+  const dueCards = data.flashcards.filter((card) => card.nextReview <= today()).length;
+  const overdueCards = data.flashcards.filter((card) => card.nextReview < today()).length;
+  const reviewedCards = data.flashcards.filter((card) => card.lastReviewed).length;
+  const goodCards = data.flashcards.filter((card) => card.lastReviewed && (card.difficulty === 'Good' || card.difficulty === 'Easy')).length;
+  const maxSubjectMinutes = Math.max(1, ...data.subjects.map((subject) => done.filter((session) => session.subjectId === subject.id).reduce((sum, session) => sum + session.durationMinutes, 0)));
+  const avgConfidence = data.subjects.length ? data.subjects.reduce((sum, subject) => sum + subject.confidence, 0) / data.subjects.length : 0;
+  const readiness = data.subjects.length ? Math.max(0, Math.min(100, Math.round(avgConfidence * 16 + sessionsCompleted * 2 - data.weakTopics.length * 3 - overdueCards * 2))) : 0;
   return {
     sessionsCompleted,
+    skippedSessions,
     revisionHours: Math.round((revisionMinutes / 60) * 10) / 10,
-    dueCards: data.flashcards.filter((card) => card.nextReview <= today()).length,
+    dueCards,
+    overdueCards,
+    reviewedCards,
+    goodCards,
+    maxSubjectMinutes,
+    readiness,
+    streak: studyStreak(done),
   };
+}
+
+function getNextBestBlock(data: ExamPilotData): NextBlock | undefined {
+  const ranked = data.subjects.map((subject) => {
+    const days = daysUntil(subject.examDate);
+    const weak = data.weakTopics.filter((topic) => topic.subjectId === subject.id).sort((a, b) => b.score - a.score)[0];
+    const due = data.flashcards.filter((card) => card.subjectId === subject.id && card.nextReview <= today()).length;
+    const score = priorityRank[subject.priority] * 18 + Math.max(0, 35 - days) + (6 - subject.confidence) * 7 + (weak?.score ?? 0) * 4 + due * 2;
+    return { subject, weak, due, score, days };
+  }).sort((a, b) => b.score - a.score)[0];
+  if (!ranked) return undefined;
+  const topic = ranked.weak?.topic ?? (ranked.due ? 'due flashcards' : 'exam technique');
+  return {
+    subject: ranked.subject,
+    title: `${ranked.subject.name}: ${topic}`,
+    reason: `${ranked.subject.priority} priority, ${ranked.days} days to exam, confidence ${ranked.subject.confidence}/5${ranked.weak ? `, weak topic score ${ranked.weak.score}` : ''}${ranked.due ? `, ${ranked.due} cards due` : ''}.`,
+  };
+}
+
+interface NextBlock {
+  subject: Subject;
+  title: string;
+  reason: string;
 }
 
 function getAttentionList(data: ExamPilotData) {
   const items: string[] = [];
-  [...data.subjects]
-    .sort((a, b) => daysUntil(a.examDate) - daysUntil(b.examDate) || priorityRank[b.priority] - priorityRank[a.priority])
-    .slice(0, 3)
-    .forEach((subject) => {
-      const days = daysUntil(subject.examDate);
-      if (days <= 21 || subject.priority === 'Critical' || subject.confidence <= 2) {
-        const weak = data.weakTopics.find((topic) => topic.subjectId === subject.id)?.topic;
-        items.push(`${subject.name}: ${days} days to exam, ${subject.priority.toLowerCase()} priority, confidence ${subject.confidence}/5${weak ? `. Start with ${weak}.` : '.'}`);
-      }
-    });
+  [...data.subjects].sort((a, b) => daysUntil(a.examDate) - daysUntil(b.examDate) || priorityRank[b.priority] - priorityRank[a.priority]).slice(0, 3).forEach((subject) => {
+    const days = daysUntil(subject.examDate);
+    if (days <= 21 || subject.priority === 'Critical' || subject.confidence <= 2) {
+      const weak = data.weakTopics.find((topic) => topic.subjectId === subject.id)?.topic;
+      items.push(`${subject.name}: ${days} days to exam, ${subject.priority.toLowerCase()} priority, confidence ${subject.confidence}/5${weak ? `. Start with ${weak}.` : '.'}`);
+    }
+  });
   const due = data.flashcards.filter((card) => card.nextReview <= today()).length;
   if (due) items.push(`${due} flashcard${due === 1 ? '' : 's'} due today. Do retrieval before re-reading notes.`);
   const skipped = data.sessions.filter((session) => session.status === 'skipped').length;
-  if (skipped) items.push(`${skipped} skipped session${skipped === 1 ? '' : 's'} need rescheduling or a smaller replacement task.`);
+  if (skipped) items.push(`${skipped} skipped session${skipped === 1 ? '' : 's'} need a smaller recovery block.`);
   return items;
 }
 
-function subjectName(data: ExamPilotData, id: string) {
-  return data.subjects.find((subject) => subject.id === id)?.name ?? 'Unknown subject';
+function topicMasteryRows(subject: Subject, data: ExamPilotData) {
+  const topics = new Set<string>();
+  data.guidance.filter((item) => item.subjectId === subject.id).forEach((item) => item.analysis?.keyTopics.forEach((topic) => topics.add(topic)));
+  data.flashcards.filter((card) => card.subjectId === subject.id).forEach((card) => topics.add(card.topic));
+  data.practiceQuestions.filter((question) => question.subjectId === subject.id).forEach((question) => topics.add(question.topic));
+  data.weakTopics.filter((weak) => weak.subjectId === subject.id).forEach((weak) => topics.add(weak.topic));
+  return [...topics].slice(0, 10).map((topic) => {
+    const weak = data.weakTopics.find((item) => item.subjectId === subject.id && item.topic.toLowerCase() === topic.toLowerCase());
+    const correct = data.practiceQuestions.filter((item) => item.subjectId === subject.id && item.topic === topic && item.result === 'correct').length;
+    const cards = data.flashcards.filter((item) => item.subjectId === subject.id && item.topic === topic && item.lastReviewed).length;
+    const score = Math.max(10, Math.min(95, 45 + correct * 12 + cards * 5 - (weak?.score ?? 0) * 7 + subject.confidence * 5));
+    return {
+      topic,
+      score,
+      level: score > 75 ? 'secure' : score > 50 ? 'developing' : 'fragile',
+      reason: weak ? `Weak-topic score ${weak.score}` : `${correct} correct practice answers · ${cards} reviewed cards`,
+    };
+  });
+}
+
+function subjectReadiness(data: ExamPilotData, subject: Subject) {
+  const weak = data.weakTopics.filter((topic) => topic.subjectId === subject.id).reduce((sum, topic) => sum + topic.score, 0);
+  const done = data.sessions.filter((session) => session.subjectId === subject.id && session.status === 'done').length;
+  const due = data.flashcards.filter((card) => card.subjectId === subject.id && card.nextReview <= today()).length;
+  return Math.max(0, Math.min(100, Math.round(subject.confidence * 17 + done * 4 - weak * 3 - due * 2)));
+}
+
+function getRecentActivity(data: ExamPilotData, subjectId: string) {
+  return [
+    ...data.flashcards.filter((card) => card.subjectId === subjectId && card.lastReviewed).map((card) => ({ title: `Reviewed ${card.topic}`, meta: card.lastReviewed?.slice(0, 10) ?? '' })),
+    ...data.sessions.filter((session) => session.subjectId === subjectId && session.status !== 'planned').map((session) => ({ title: `${session.status}: ${session.title}`, meta: session.date })),
+    ...data.practiceQuestions.filter((question) => question.subjectId === subjectId && question.result).map((question) => ({ title: `${question.result}: ${question.topic}`, meta: question.prompt })),
+  ].slice(0, 8);
+}
+
+function sessionsForDate(sessions: TimetableSession[], date: string) {
+  return [...sessions].filter((session) => session.date === date).sort((a, b) => a.startTime.localeCompare(b.startTime));
+}
+
+function nextSevenDays() {
+  return Array.from({ length: 7 }, (_, index) => {
+    const date = new Date();
+    date.setDate(date.getDate() + index);
+    return {
+      date: date.toISOString().slice(0, 10),
+      label: index === 0 ? 'Today' : date.toLocaleDateString(undefined, { weekday: 'short' }),
+    };
+  });
+}
+
+function getDueCards(cards: Flashcard[]) {
+  return [...cards].filter((card) => card.nextReview <= today()).sort((a, b) => a.nextReview.localeCompare(b.nextReview));
+}
+
+function studyStreak(done: TimetableSession[]) {
+  const dates = new Set(done.map((session) => session.date));
+  let streak = 0;
+  const cursor = new Date();
+  for (let i = 0; i < 90; i += 1) {
+    const key = cursor.toISOString().slice(0, 10);
+    if (!dates.has(key)) break;
+    streak += 1;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+  return streak;
+}
+
+function daysUntil(date: string) {
+  const end = new Date(`${date}T12:00:00`);
+  const start = new Date();
+  start.setHours(12, 0, 0, 0);
+  return Math.ceil((end.getTime() - start.getTime()) / 86400000);
+}
+
+function formatCountdown(date: string) {
+  const days = daysUntil(date);
+  if (days < 0) return `${Math.abs(days)}d past`;
+  if (days === 0) return 'today';
+  if (days === 1) return '1 day';
+  return `${days} days`;
+}
+
+function formatTimer(seconds: number) {
+  const mins = Math.floor(seconds / 60).toString().padStart(2, '0');
+  const secs = (seconds % 60).toString().padStart(2, '0');
+  return `${mins}:${secs}`;
+}
+
+function subjectById(data: ExamPilotData, id?: string) {
+  return data.subjects.find((subject) => subject.id === id);
+}
+
+function subjectName(data: ExamPilotData, id?: string) {
+  return subjectById(data, id)?.name ?? 'No subject';
 }
 
 export default App;

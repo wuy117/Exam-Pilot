@@ -14,7 +14,11 @@ export const loadData = (): ExamPilotData => {
 };
 
 export const saveData = (data: ExamPilotData) => {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  } catch (error) {
+    console.warn('ExamPilot could not save to localStorage:', error);
+  }
 };
 
 export const exportData = (data: ExamPilotData) => {
