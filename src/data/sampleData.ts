@@ -10,10 +10,13 @@ const daysFromNow = (days: number) => {
 export const emptyData: ExamPilotData = {
   subjects: [],
   guidance: [],
+  knowledgeDocuments: [],
   topics: [],
+  topicMastery: [],
   sessions: [],
   flashcards: [],
   practiceQuestions: [],
+  pastPaperItems: [],
   weakTopics: [],
   aiMessages: [],
 };
@@ -52,7 +55,37 @@ export const sampleData: ExamPilotData = {
       updatedAt: now,
     },
   ],
+  knowledgeDocuments: [
+    {
+      id: 'doc-chemistry-checklist',
+      subjectId: 'subject-chemistry',
+      sourceName: 'Teacher checklist: acids and electrolysis',
+      type: 'teacher-note',
+      status: 'ready',
+      uploadedAt: now,
+      updatedAt: now,
+      text:
+        'Revise strong and weak acids, pH calculations, neutralisation, salt preparation, electrolysis of molten ionic compounds, aqueous electrolysis, half equations, and required practical method questions.',
+      extractedTopics: ['Acids', 'Electrolysis', 'Half equations', 'Required practicals'],
+    },
+  ],
   topics: [],
+  topicMastery: [
+    {
+      id: 'mastery-acids',
+      subjectId: 'subject-chemistry',
+      topic: 'Acids',
+      confidence: 3,
+      lastRevised: daysFromNow(-1),
+      revisionCount: 2,
+      quizAttempts: 3,
+      quizCorrect: 1,
+      flashcardReviews: 2,
+      flashcardGood: 1,
+      aiEstimatedMastery: 48,
+      updatedAt: now,
+    },
+  ],
   sessions: [
     {
       id: 'session-chemistry-acids',
@@ -81,6 +114,7 @@ export const sampleData: ExamPilotData = {
     },
   ],
   practiceQuestions: [],
+  pastPaperItems: [],
   weakTopics: [
     {
       id: 'weak-acids',

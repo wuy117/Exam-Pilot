@@ -5,6 +5,8 @@ export type SessionStatus = 'planned' | 'done' | 'skipped';
 export type FlashcardDifficulty = 'Again' | 'Hard' | 'Good' | 'Easy';
 export type PracticeQuestionType = 'multiple-choice' | 'short-answer' | 'definition' | 'exam-style' | 'essay-plan';
 export type PracticeResult = 'correct' | 'partial' | 'incorrect';
+export type KnowledgeDocumentStatus = 'extracting' | 'ready' | 'failed';
+export type KnowledgeDocumentType = 'pdf' | 'text' | 'note' | 'mark-scheme' | 'specification' | 'textbook' | 'teacher-note' | 'revision-guide';
 
 export interface Subject {
   id: string;
@@ -25,6 +27,19 @@ export interface RevisionGuidance {
   createdAt: string;
   updatedAt: string;
   analysis?: AIAnalysis;
+}
+
+export interface KnowledgeDocument {
+  id: string;
+  subjectId: string;
+  sourceName: string;
+  type: KnowledgeDocumentType;
+  status: KnowledgeDocumentStatus;
+  uploadedAt: string;
+  updatedAt: string;
+  text: string;
+  extractedTopics: string[];
+  error?: string;
 }
 
 export interface Topic {
@@ -85,6 +100,34 @@ export interface WeakTopic {
   updatedAt: string;
 }
 
+export interface TopicMastery {
+  id: string;
+  subjectId: string;
+  topic: string;
+  confidence: ConfidenceLevel;
+  lastRevised?: string;
+  revisionCount: number;
+  quizAttempts: number;
+  quizCorrect: number;
+  flashcardReviews: number;
+  flashcardGood: number;
+  aiEstimatedMastery: number;
+  updatedAt: string;
+}
+
+export interface PastPaperItem {
+  id: string;
+  subjectId: string;
+  sourceName: string;
+  questionText: string;
+  topic: string;
+  difficulty: 'Foundation' | 'Standard' | 'Higher' | 'Unknown';
+  modelAnswer?: string;
+  markSchemePoints: string[];
+  followUpRevision: string[];
+  createdAt: string;
+}
+
 export interface AIMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -106,10 +149,13 @@ export interface AIAnalysis {
 export interface ExamPilotData {
   subjects: Subject[];
   guidance: RevisionGuidance[];
+  knowledgeDocuments: KnowledgeDocument[];
   topics: Topic[];
+  topicMastery: TopicMastery[];
   sessions: TimetableSession[];
   flashcards: Flashcard[];
   practiceQuestions: PracticeQuestion[];
+  pastPaperItems: PastPaperItem[];
   weakTopics: WeakTopic[];
   aiMessages: AIMessage[];
 }

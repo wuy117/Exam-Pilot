@@ -17,6 +17,7 @@ import {
   Layers3,
   Library,
   ListChecks,
+  Loader2,
   MessageSquareText,
   Moon,
   MoreHorizontal,
@@ -42,6 +43,7 @@ import {
   subscribeAIBackendStatus,
   type AIBackendStatus,
 } from './services/ai';
+import { extractPdfText } from './services/pdf';
 import { exportData, importData, loadData, saveData } from './services/storage';
 import type {
   AIMessage,
@@ -49,16 +51,20 @@ import type {
   ExamPilotData,
   Flashcard,
   FlashcardDifficulty,
+  KnowledgeDocument,
+  KnowledgeDocumentType,
+  PastPaperItem,
   PracticeQuestion,
   PracticeResult,
   PriorityLevel,
   Subject,
   TimetableMode,
   TimetableSession,
+  TopicMastery,
   WeakTopic,
 } from './types';
 
-type View = 'Dashboard' | 'Subject' | 'Guidance' | 'Timetable' | 'Flashcards' | 'AI' | 'Practice' | 'Review' | 'Analytics';
+type View = 'Dashboard' | 'Subject' | 'Guidance' | 'Timetable' | 'Flashcards' | 'AI' | 'Practice' | 'Papers' | 'Review' | 'Analytics';
 type FlashcardSettings = 'definitions' | 'exam questions' | 'dates' | 'formulas' | 'vocab' | 'essay evidence';
 
 const today = () => new Date().toISOString().slice(0, 10);
@@ -69,11 +75,12 @@ const swatches = ['#334155', '#0f766e', '#1d4ed8', '#6d28d9', '#9f1239', '#a1620
 const navItems: Array<[View, ReactNode, string]> = [
   ['Dashboard', <Target size={17} />, 'Overview'],
   ['Subject', <Layers3 size={17} />, 'Subject centre'],
-  ['Guidance', <FileText size={17} />, 'Guidance'],
+  ['Guidance', <FileText size={17} />, 'Knowledge base'],
   ['Timetable', <CalendarDays size={17} />, 'Timetable'],
   ['Flashcards', <BookOpen size={17} />, 'Cards'],
   ['AI', <MessageSquareText size={17} />, 'Exam Expert'],
-  ['Practice', <Brain size={17} />, 'Practice'],
+  ['Practice', <Brain size={17} />, 'Question bank'],
+  ['Papers', <Library size={17} />, 'Past papers'],
   ['Review', <ListChecks size={17} />, 'Daily review'],
   ['Analytics', <BarChart3 size={17} />, 'Analytics'],
 ];
@@ -87,9 +94,26 @@ function App() {
   const [activeSubjectId, setActiveSubjectId] = useState('');
   const [mode, setMode] = useState<TimetableMode>('Normal');
   const [aiStatus, setAiStatus] = useState<AIBackendStatus>('idle');
+  const [commandOpen, setCommandOpen] = useState(false);
 
-  useEffect(() => saveData(data), [data]);
+  useEffect(() => {
+    const handle = window.setTimeout(() => saveData(data), 250);
+    return () => window.clearTimeout(handle);
+  }, [data]);
   useEffect(() => subscribeAIBackendStatus(setAiStatus), []);
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isTyping = target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.tagName === 'SELECT';
+      if ((event.key === '/' && !isTyping) || ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k')) {
+        event.preventDefault();
+        setCommandOpen(true);
+      }
+      if (event.key === 'Escape') setCommandOpen(false);
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
   useEffect(() => {
     if (!activeSubjectId && data.subjects[0]) setActiveSubjectId(data.subjects[0].id);
   }, [activeSubjectId, data.subjects]);
@@ -217,6 +241,9 @@ function App() {
             {activeView === 'Practice' && activeSubject && (
               <PracticePanel data={data} subject={activeSubject} updateData={updateData} onWeakTopic={upsertWeakTopic} />
             )}
+            {activeView === 'Papers' && activeSubject && (
+              <PastPaperPanel data={data} subject={activeSubject} updateData={updateData} onWeakTopic={upsertWeakTopic} />
+            )}
             {activeView === 'Review' && (
               <DailyReviewPanel data={data} analytics={analytics} nextBlock={nextBlock} onTonight={askTonight} onView={setActiveView} />
             )}
@@ -229,6 +256,25 @@ function App() {
       </div>
 
       <MobileNav activeView={activeView} onView={setActiveView} />
+      {commandOpen && (
+        <CommandPalette
+          subjects={data.subjects}
+          onClose={() => setCommandOpen(false)}
+          onView={(view) => {
+            setActiveView(view);
+            setCommandOpen(false);
+          }}
+          onSubject={(id) => {
+            setActiveSubjectId(id);
+            setActiveView('Subject');
+            setCommandOpen(false);
+          }}
+          onTonight={() => {
+            setCommandOpen(false);
+            askTonight();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -563,6 +609,14 @@ function SubjectCentre({
                   <div className="h-1.5 rounded-full bg-stone-900" style={{ width: `${row.score}%` }} />
                 </div>
                 <p className="mt-2 text-xs text-stone-500">{row.reason}</p>
+                <TopicActions
+                  data={data}
+                  subject={subject}
+                  topic={row.topic}
+                  updateData={updateData}
+                  onWeakTopic={onWeakTopic}
+                  onView={onView}
+                />
               </div>
             )) : <EmptyState title="No topic map yet" body="Analyse guidance or generate practice to build topic mastery." />}
           </div>
@@ -635,20 +689,82 @@ function SubjectCentre({
 function GuidancePanel({ data, subject, updateData, onWeakTopic }: { data: ExamPilotData; subject: Subject; updateData: (updater: (current: ExamPilotData) => ExamPilotData) => void; onWeakTopic: (topic: string) => void }) {
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
+  const [documentType, setDocumentType] = useState<KnowledgeDocumentType>('teacher-note');
+  const [extractionProgress, setExtractionProgress] = useState(0);
   const subjectGuidance = data.guidance.filter((item) => item.subjectId === subject.id);
+  const documents = data.knowledgeDocuments.filter((item) => item.subjectId === subject.id);
 
   const addGuidance = (event: FormEvent) => {
     event.preventDefault();
     if (!content.trim()) return;
+    const sourceName = title || `${subject.name} knowledge note`;
+    const topics = extractTopicsFromText(content);
     updateData((current) => ({
       ...current,
+      knowledgeDocuments: [
+        {
+          id: newId('doc'),
+          subjectId: subject.id,
+          sourceName,
+          type: documentType,
+          status: 'ready',
+          uploadedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          text: content,
+          extractedTopics: topics,
+        },
+        ...current.knowledgeDocuments,
+      ],
       guidance: [
-        { id: newId('guidance'), subjectId: subject.id, title: title || `${subject.name} guidance`, content, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+        { id: newId('guidance'), subjectId: subject.id, title: sourceName, content, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
         ...current.guidance,
       ],
     }));
     setTitle('');
     setContent('');
+  };
+
+  const uploadPdf = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    const docId = newId('doc');
+    setExtractionProgress(1);
+    updateData((current) => ({
+      ...current,
+      knowledgeDocuments: [
+        {
+          id: docId,
+          subjectId: subject.id,
+          sourceName: file.name,
+          type: 'pdf',
+          status: 'extracting',
+          uploadedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          text: '',
+          extractedTopics: [],
+        },
+        ...current.knowledgeDocuments,
+      ],
+    }));
+
+    const result = await extractPdfText(file, setExtractionProgress);
+    const topics = extractTopicsFromText(result.text);
+    updateData((current) => ({
+      ...current,
+      knowledgeDocuments: current.knowledgeDocuments.map((doc) =>
+        doc.id === docId
+          ? { ...doc, status: result.status, text: result.text, extractedTopics: topics, error: result.error, updatedAt: new Date().toISOString() }
+          : doc,
+      ),
+      guidance: result.status === 'ready'
+        ? [
+            { id: newId('guidance'), subjectId: subject.id, title: file.name, content: result.text, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+            ...current.guidance,
+          ]
+        : current.guidance,
+    }));
+    setExtractionProgress(0);
   };
 
   const analyse = async (guidanceId: string, guidanceContent: string) => {
@@ -660,13 +776,58 @@ function GuidancePanel({ data, subject, updateData, onWeakTopic }: { data: ExamP
     }));
   };
 
+  const deleteDocument = (document: KnowledgeDocument) => {
+    updateData((current) => ({
+      ...current,
+      knowledgeDocuments: current.knowledgeDocuments.filter((item) => item.id !== document.id),
+      guidance: current.guidance.filter((item) => !(item.subjectId === document.subjectId && item.title === document.sourceName && item.content === document.text)),
+    }));
+  };
+
   return (
-    <Panel eyebrow="Guidance library" title={`${subject.name} source material`} subtitle="Store specification notes, teacher advice, mark schemes, and syllabus checklists by subject.">
-      <form className="premium-form" onSubmit={addGuidance}>
-        <input className="input" value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Guidance title" />
-        <textarea className="input min-h-28 lg:col-span-2" value={content} onChange={(event) => setContent(event.target.value)} placeholder="Paste specification notes, teacher advice, or mark-scheme guidance..." />
-        <button className="btn-primary self-start"><Plus size={16} /> Save guidance</button>
-      </form>
+    <Panel eyebrow="Knowledge base" title={`${subject.name} source of truth`} subtitle="Upload PDFs or paste specifications, notes, mark schemes, textbook extracts, and teacher guidance. AI uses this first.">
+      <div className="grid gap-4 xl:grid-cols-[1fr_0.8fr]">
+        <form className="space-y-3 rounded-lg border border-stone-200 bg-stone-50 p-4" onSubmit={addGuidance}>
+          <div className="grid gap-3 sm:grid-cols-[1fr_180px]">
+            <input className="input" value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Source name, e.g. Paper 2 specification" />
+            <select className="input" value={documentType} onChange={(event) => setDocumentType(event.target.value as KnowledgeDocumentType)}>
+              {['teacher-note', 'specification', 'mark-scheme', 'textbook', 'note', 'revision-guide'].map((item) => <option key={item} value={item}>{item}</option>)}
+            </select>
+          </div>
+          <textarea className="input min-h-36" value={content} onChange={(event) => setContent(event.target.value)} placeholder="Paste specification notes, teacher advice, mark schemes, textbook extracts, or personal notes..." />
+          <div className="flex flex-wrap gap-2">
+            <button className="btn-primary"><Plus size={16} /> Save to knowledge base</button>
+            <label className="btn-secondary cursor-pointer">
+              <Upload size={16} /> Upload PDF
+              <input className="hidden" type="file" accept="application/pdf" onChange={uploadPdf} />
+            </label>
+            {extractionProgress > 0 && <span className="ai-pill"><Loader2 size={13} className="animate-spin" /> Extracting {extractionProgress}%</span>}
+          </div>
+        </form>
+
+        <section className="rounded-lg border border-stone-200 bg-white p-4">
+          <SectionTitle icon={<Library size={17} />} title="Documents" />
+          <div className="mt-4 space-y-2">
+            {documents.length ? documents.map((doc) => (
+              <div key={doc.id} className="document-row">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3>{doc.sourceName}</h3>
+                    <span className={`pill status-${doc.status === 'ready' ? 'done' : doc.status === 'failed' ? 'skipped' : 'planned'}`}>{doc.status}</span>
+                  </div>
+                  <p>{doc.type} · uploaded {doc.uploadedAt.slice(0, 10)} · {doc.text.length.toLocaleString()} chars</p>
+                  {doc.error && <p className="text-rose-700">{doc.error}</p>}
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    {doc.extractedTopics.slice(0, 6).map((topic) => <span key={topic} className="pill">{topic}</span>)}
+                  </div>
+                </div>
+                <button className="icon-button" title="Delete document" onClick={() => deleteDocument(doc)}><Trash2 size={15} /></button>
+              </div>
+            )) : <EmptyState title="No documents yet" body="Upload a PDF or paste source material to build the subject knowledge base." compact />}
+          </div>
+        </section>
+      </div>
+
       <div className="mt-5 space-y-3">
         {subjectGuidance.length ? subjectGuidance.map((item) => (
           <article key={item.id} className="document-card">
@@ -682,6 +843,91 @@ function GuidancePanel({ data, subject, updateData, onWeakTopic }: { data: ExamP
         )) : <EmptyState title="No guidance saved" body="Paste the exact information your teacher or specification gives you. This becomes the AI context." />}
       </div>
     </Panel>
+  );
+}
+
+function TopicActions({
+  data,
+  subject,
+  topic,
+  updateData,
+  onWeakTopic,
+  onView,
+}: {
+  data: ExamPilotData;
+  subject: Subject;
+  topic: string;
+  updateData: (updater: (current: ExamPilotData) => ExamPilotData) => void;
+  onWeakTopic: (subjectId: string, topic: string, source: string, delta?: number) => void;
+  onView: (view: View) => void;
+}) {
+  const saveAiAnswer = async (prompt: string) => {
+    const answer = await askExamExpert(prompt, subject, data);
+    updateData((current) => ({
+      ...current,
+      aiMessages: [
+        ...current.aiMessages,
+        {
+          id: newId('message'),
+          role: 'assistant',
+          content: answer,
+          createdAt: new Date().toISOString(),
+          subjectId: subject.id,
+          contextSummary: `${subject.name} · ${topic} · knowledge base first`,
+        },
+      ],
+    }));
+    onView('AI');
+  };
+
+  const makeCards = async () => {
+    const docs = data.knowledgeDocuments.filter((doc) => doc.subjectId === subject.id && doc.text.toLowerCase().includes(topic.toLowerCase()));
+    const cards = await generateFlashcards(subject, [`Topic: ${topic}`, ...docs.map((doc) => doc.text)].join('\n\n'), data);
+    updateData((current) => ({ ...current, flashcards: [...cards, ...current.flashcards] }));
+    onView('Flashcards');
+  };
+
+  const makeQuiz = async (kind = 'quiz') => {
+    const questions = await generatePracticeQuestions(subject, `${topic} (${kind})`, data);
+    updateData((current) => ({ ...current, practiceQuestions: [...questions, ...current.practiceQuestions] }));
+    onView('Practice');
+  };
+
+  const makeSession = () => {
+    updateData((current) => ({
+      ...current,
+      topicMastery: upsertTopicMastery(current.topicMastery, subject.id, topic, { revisionCountDelta: 1 }),
+      sessions: [
+        {
+          id: newId('session'),
+          subjectId: subject.id,
+          title: `${subject.name}: ${topic}`,
+          type: 'revision',
+          date: today(),
+          startTime: '19:30',
+          durationMinutes: 30,
+          mode: 'Normal',
+          status: 'planned',
+          topic,
+          reason: 'Created from one-click topic action.',
+        },
+        ...current.sessions,
+      ],
+    }));
+    onView('Timetable');
+  };
+
+  return (
+    <div className="topic-actions">
+      <button onClick={() => saveAiAnswer(`Explain ${topic} for ${subject.name} using my uploaded knowledge base first.`)}>Explain</button>
+      <button onClick={makeCards}>Flashcards</button>
+      <button onClick={() => makeQuiz('quiz')}>Quiz</button>
+      <button onClick={() => makeQuiz('exam questions')}>Exam questions</button>
+      <button onClick={() => saveAiAnswer(`Create an essay plan for ${topic} in ${subject.name}, if this subject uses essays. If not, create an extended response plan.`)}>Essay plan</button>
+      <button onClick={() => saveAiAnswer(`Summarise ${topic} for ${subject.name} into concise GCSE/IGCSE revision notes and mark-scheme points.`)}>Summarise</button>
+      <button onClick={makeSession}>30-minute session</button>
+      <button onClick={() => onWeakTopic(subject.id, topic, 'manual topic flag', 1)}>Flag weak</button>
+    </div>
   );
 }
 
@@ -815,6 +1061,7 @@ function FlashcardPanel({ data, activeSubject, updateData, onWeakTopic }: { data
   const [filter, setFilter] = useState<'due' | 'overdue' | 'all'>('due');
   const [topicFilter, setTopicFilter] = useState('');
   const [settings, setSettings] = useState<FlashcardSettings>('definitions');
+  const [cardSupport, setCardSupport] = useState('');
 
   const scopedCards = data.flashcards
     .filter((card) => !activeSubject || card.subjectId === activeSubject.id)
@@ -863,6 +1110,10 @@ function FlashcardPanel({ data, activeSubject, updateData, onWeakTopic }: { data
     if (difficulty === 'Again' || difficulty === 'Hard') onWeakTopic(card.subjectId, card.topic, 'flashcard review', difficulty === 'Again' ? 2 : 1);
     updateData((current) => ({
       ...current,
+      topicMastery: upsertTopicMastery(current.topicMastery, card.subjectId, card.topic, {
+        flashcardReviewsDelta: 1,
+        flashcardGoodDelta: difficulty === 'Good' || difficulty === 'Easy' ? 1 : 0,
+      }),
       flashcards: current.flashcards.map((item) =>
         item.id === card.id ? { ...item, difficulty, lastReviewed: new Date().toISOString(), nextReview: next.toISOString().slice(0, 10) } : item,
       ),
@@ -877,6 +1128,15 @@ function FlashcardPanel({ data, activeSubject, updateData, onWeakTopic }: { data
     link.download = `exampilot-flashcards-${today()}.json`;
     link.click();
     URL.revokeObjectURL(url);
+  };
+
+  const explainCard = async (kind: 'explanation' | 'memory aid') => {
+    if (!reviewCard) return;
+    const subject = subjectById(data, reviewCard.subjectId);
+    const prompt = kind === 'explanation'
+      ? `Explain this flashcard answer clearly and exam-focused: Q: ${reviewCard.question} A: ${reviewCard.answer}`
+      : `Create a concise memory aid for this flashcard without being childish: Q: ${reviewCard.question} A: ${reviewCard.answer}`;
+    setCardSupport(await askExamExpert(prompt, subject, data));
   };
 
   return (
@@ -903,6 +1163,11 @@ function FlashcardPanel({ data, activeSubject, updateData, onWeakTopic }: { data
               </div>
               <h3>{reviewCard.question}</h3>
               <p>{reviewCard.answer}</p>
+              <div className="flex flex-wrap gap-2">
+                <button className="btn-secondary" onClick={() => explainCard('explanation')}><Sparkles size={15} /> Explain answer</button>
+                <button className="btn-secondary" onClick={() => explainCard('memory aid')}><Brain size={15} /> Memory aid</button>
+              </div>
+              {cardSupport && <div className="support-note">{cardSupport}</div>}
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                 {(['Again', 'Hard', 'Good', 'Easy'] as FlashcardDifficulty[]).map((item) => (
                   <button key={item} className="btn-secondary justify-center" onClick={() => review(reviewCard, item)}>{item}</button>
@@ -1077,6 +1342,10 @@ function PracticePanel({ data, subject, updateData, onWeakTopic }: { data: ExamP
     if (result !== 'correct') onWeakTopic(subject.id, questionTopic, 'practice mistake', result === 'incorrect' ? 3 : 1);
     updateData((current) => ({
       ...current,
+      topicMastery: upsertTopicMastery(current.topicMastery, subject.id, questionTopic, {
+        quizAttemptsDelta: 1,
+        quizCorrectDelta: result === 'correct' ? 1 : 0,
+      }),
       practiceQuestions: current.practiceQuestions.map((question) => (question.id === id ? { ...question, result } : question)),
     }));
   };
@@ -1142,6 +1411,90 @@ function PracticePanel({ data, subject, updateData, onWeakTopic }: { data: ExamP
           </div>
         </section>
       </div>
+    </div>
+  );
+}
+
+function PastPaperPanel({ data, subject, updateData, onWeakTopic }: { data: ExamPilotData; subject: Subject; updateData: (updater: (current: ExamPilotData) => ExamPilotData) => void; onWeakTopic: (subjectId: string, topic: string, source: string, delta?: number) => void }) {
+  const [sourceName, setSourceName] = useState('');
+  const [questionText, setQuestionText] = useState('');
+  const [topicHint, setTopicHint] = useState('');
+  const [loading, setLoading] = useState(false);
+  const items = data.pastPaperItems.filter((item) => item.subjectId === subject.id);
+
+  const analyseQuestion = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!questionText.trim()) return;
+    setLoading(true);
+    const prompt = [
+      `Analyse this past-paper question for ${subject.name}.`,
+      'Identify the topic, estimate difficulty, give a model answer, mark-scheme bullet points, and follow-up revision.',
+      'Use uploaded knowledge-base documents first, then general GCSE/IGCSE knowledge only if needed.',
+      topicHint ? `Topic hint: ${topicHint}` : '',
+      `Question:\n${questionText}`,
+    ].filter(Boolean).join('\n\n');
+    const answer = await askExamExpert(prompt, subject, data);
+    const topic = topicHint || inferTopicFromText(questionText, data, subject.id) || 'AI identified topic';
+    const markSchemePoints = extractBulletishLines(answer).slice(0, 8);
+    const item: PastPaperItem = {
+      id: newId('paper'),
+      subjectId: subject.id,
+      sourceName: sourceName || 'Pasted exam question',
+      questionText,
+      topic,
+      difficulty: inferDifficulty(questionText),
+      modelAnswer: answer,
+      markSchemePoints: markSchemePoints.length ? markSchemePoints : ['Check answer against the official mark scheme.', 'Convert missing marks into flashcards.'],
+      followUpRevision: [`Revise ${topic}`, 'Attempt a similar timed question', 'Log any missing mark-scheme points'],
+      createdAt: new Date().toISOString(),
+    };
+    updateData((current) => ({
+      ...current,
+      pastPaperItems: [item, ...current.pastPaperItems],
+      topicMastery: upsertTopicMastery(current.topicMastery, subject.id, topic, { quizAttemptsDelta: 1 }),
+    }));
+    onWeakTopic(subject.id, topic, 'past paper assistant', 1);
+    setQuestionText('');
+    setTopicHint('');
+    setSourceName('');
+    setLoading(false);
+  };
+
+  return (
+    <div className="space-y-5">
+      <PageHeader
+        eyebrow="Past paper assistant"
+        title={`${subject.name} exam-question workspace`}
+        subtitle="Paste exam questions, identify topics, estimate difficulty, generate model answers, mark-scheme bullets, and follow-up revision."
+      />
+      <section className="panel">
+        <form className="space-y-3" onSubmit={analyseQuestion}>
+          <div className="grid gap-3 md:grid-cols-2">
+            <input className="input" value={sourceName} onChange={(event) => setSourceName(event.target.value)} placeholder="Source, e.g. June 2024 Paper 1 Q5" />
+            <input className="input" value={topicHint} onChange={(event) => setTopicHint(event.target.value)} placeholder="Optional topic hint" />
+          </div>
+          <textarea className="input min-h-40" value={questionText} onChange={(event) => setQuestionText(event.target.value)} placeholder="Paste an exam question, source extract, essay prompt, or mark-scheme fragment..." />
+          <button className="btn-primary" disabled={loading}>{loading ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />} Analyse question</button>
+        </form>
+      </section>
+      <section className="panel">
+        <SectionTitle icon={<Library size={17} />} title="Analysed questions" />
+        <div className="mt-4 grid gap-3 xl:grid-cols-2">
+          {items.length ? items.map((item) => (
+            <article key={item.id} className="question-card">
+              <div className="flex flex-wrap gap-2">
+                <span className="pill">{item.sourceName}</span>
+                <span className="pill">{item.topic}</span>
+                <span className="pill">{item.difficulty}</span>
+              </div>
+              <h3>{item.questionText}</h3>
+              {item.modelAnswer && <p className="muted">{item.modelAnswer}</p>}
+              <BulletList title="Mark-scheme points" items={item.markSchemePoints} />
+              <BulletList title="Follow-up revision" items={item.followUpRevision} />
+            </article>
+          )) : <EmptyState title="No analysed questions yet" body="Paste a past-paper question to turn it into a revision task." />}
+        </div>
+      </section>
     </div>
   );
 }
@@ -1285,6 +1638,9 @@ function FocusMode() {
   const [minutes, setMinutes] = useState(25);
   const [secondsLeft, setSecondsLeft] = useState(25 * 60);
   const [running, setRunning] = useState(false);
+  const [task, setTask] = useState('One focused revision block');
+  const [progress, setProgress] = useState(0);
+  const [help, setHelp] = useState('');
 
   useEffect(() => {
     if (!running) return;
@@ -1302,19 +1658,31 @@ function FocusMode() {
     setRunning(false);
   };
 
+  const complete = () => {
+    setProgress(100);
+    setRunning(false);
+  };
+
   return (
     <section className="panel focus-panel">
       <div>
         <p className="eyebrow">Focus mode</p>
-        <h3>Pomodoro timer</h3>
-        <p>Use this for one clearly scoped revision block, then log the result honestly.</p>
+        <h3>Distraction-free study mode</h3>
+        <input className="focus-task-input" value={task} onChange={(event) => setTask(event.target.value)} aria-label="Current focus task" />
+        <div className="mt-3 h-2 rounded-full bg-stone-200">
+          <div className="h-2 rounded-full bg-stone-950 transition-all duration-300" style={{ width: `${progress}%` }} />
+        </div>
       </div>
       <div className="timer-face">{formatTimer(secondsLeft)}</div>
       <div className="flex flex-wrap gap-2">
         {[25, 45, 60].map((value) => <button key={value} className={`chip ${minutes === value ? 'chip-active' : ''}`} onClick={() => reset(value)}>{value}m</button>)}
         <button className="btn-primary" onClick={() => setRunning((value) => !value)}>{running ? <Pause size={16} /> : <Play size={16} />}{running ? 'Pause' : 'Start'}</button>
         <button className="btn-secondary" onClick={() => reset()}><TimerReset size={16} /> Reset</button>
+        <button className="btn-secondary" onClick={() => setHelp('Quick AI help: name the command word, recall the mark-scheme points, answer one narrow question, then check notes.')}>AI help</button>
+        <button className="btn-secondary" onClick={() => setProgress((value) => Math.min(100, value + 25))}>+25%</button>
+        <button className="btn-primary" onClick={complete}><Check size={16} /> Finish session</button>
       </div>
+      {help && <p className="focus-help">{help}</p>}
     </section>
   );
 }
@@ -1331,6 +1699,47 @@ function MobileNav({ activeView, onView }: { activeView: View; onView: (view: Vi
     <nav className="mobile-nav">
       {mobileItems.map(([view, icon]) => <button key={view} className={activeView === view ? 'mobile-active' : ''} onClick={() => onView(view)}>{icon}<span>{view === 'Flashcards' ? 'Cards' : view}</span></button>)}
     </nav>
+  );
+}
+
+function CommandPalette({
+  subjects,
+  onClose,
+  onView,
+  onSubject,
+  onTonight,
+}: {
+  subjects: Subject[];
+  onClose: () => void;
+  onView: (view: View) => void;
+  onSubject: (id: string) => void;
+  onTonight: () => void;
+}) {
+  const [filter, setFilter] = useState('');
+  const actions: Array<{ label: string; meta: string; run: () => void }> = [
+    { label: 'What should I revise now?', meta: 'AI planner', run: onTonight },
+    ...navItems.map(([view, , label]) => ({ label: `Open ${label}`, meta: 'Navigate', run: () => onView(view) })),
+    ...subjects.map((subject) => ({ label: `Open ${subject.name}`, meta: `${formatCountdown(subject.examDate)} · ${subject.priority}`, run: () => onSubject(subject.id) })),
+  ].filter((item) => `${item.label} ${item.meta}`.toLowerCase().includes(filter.toLowerCase()));
+
+  return (
+    <div className="command-backdrop" onMouseDown={onClose}>
+      <div className="command-panel" onMouseDown={(event) => event.stopPropagation()}>
+        <label className="command-modal-input">
+          <Search size={17} />
+          <input autoFocus value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Search commands, subjects, and AI actions" />
+          <kbd>Esc</kbd>
+        </label>
+        <div className="command-results">
+          {actions.slice(0, 12).map((action) => (
+            <button key={action.label + action.meta} onClick={action.run}>
+              <span>{action.label}</span>
+              <small>{action.meta}</small>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1540,11 +1949,17 @@ function filterSubjects(data: ExamPilotData, query: string) {
   data.guidance.forEach((item) => {
     if (`${item.title} ${item.content}`.toLowerCase().includes(q)) subjectIds.add(item.subjectId);
   });
+  data.knowledgeDocuments.forEach((item) => {
+    if (`${item.sourceName} ${item.text} ${item.extractedTopics.join(' ')}`.toLowerCase().includes(q)) subjectIds.add(item.subjectId);
+  });
   data.flashcards.forEach((card) => {
     if (`${card.topic} ${card.question} ${card.answer}`.toLowerCase().includes(q)) subjectIds.add(card.subjectId);
   });
   data.weakTopics.forEach((topic) => {
     if (topic.topic.toLowerCase().includes(q)) subjectIds.add(topic.subjectId);
+  });
+  data.pastPaperItems.forEach((item) => {
+    if (`${item.sourceName} ${item.questionText} ${item.topic}`.toLowerCase().includes(q)) subjectIds.add(item.subjectId);
   });
   return data.subjects.filter((subject) => subjectIds.has(subject.id));
 }
@@ -1588,7 +2003,11 @@ function getNextBestBlock(data: ExamPilotData): NextBlock | undefined {
     const days = daysUntil(subject.examDate);
     const weak = data.weakTopics.filter((topic) => topic.subjectId === subject.id).sort((a, b) => b.score - a.score)[0];
     const due = data.flashcards.filter((card) => card.subjectId === subject.id && card.nextReview <= today()).length;
-    const score = priorityRank[subject.priority] * 18 + Math.max(0, 35 - days) + (6 - subject.confidence) * 7 + (weak?.score ?? 0) * 4 + due * 2;
+    const weakestMastery = data.topicMastery.filter((topic) => topic.subjectId === subject.id).sort((a, b) => a.aiEstimatedMastery - b.aiEstimatedMastery)[0];
+    const skipped = data.sessions.filter((session) => session.subjectId === subject.id && session.status === 'skipped').length;
+    const docs = data.knowledgeDocuments.filter((doc) => doc.subjectId === subject.id && doc.status === 'ready').length;
+    const masteryRisk = weakestMastery ? Math.max(0, 80 - weakestMastery.aiEstimatedMastery) : 12;
+    const score = priorityRank[subject.priority] * 18 + Math.max(0, 35 - days) + (6 - subject.confidence) * 7 + (weak?.score ?? 0) * 4 + due * 2 + skipped * 6 + masteryRisk + docs;
     return { subject, weak, due, score, days };
   }).sort((a, b) => b.score - a.score)[0];
   if (!ranked) return undefined;
@@ -1625,19 +2044,24 @@ function getAttentionList(data: ExamPilotData) {
 function topicMasteryRows(subject: Subject, data: ExamPilotData) {
   const topics = new Set<string>();
   data.guidance.filter((item) => item.subjectId === subject.id).forEach((item) => item.analysis?.keyTopics.forEach((topic) => topics.add(topic)));
+  data.knowledgeDocuments.filter((item) => item.subjectId === subject.id).forEach((item) => item.extractedTopics.forEach((topic) => topics.add(topic)));
   data.flashcards.filter((card) => card.subjectId === subject.id).forEach((card) => topics.add(card.topic));
   data.practiceQuestions.filter((question) => question.subjectId === subject.id).forEach((question) => topics.add(question.topic));
   data.weakTopics.filter((weak) => weak.subjectId === subject.id).forEach((weak) => topics.add(weak.topic));
+  data.topicMastery.filter((mastery) => mastery.subjectId === subject.id).forEach((mastery) => topics.add(mastery.topic));
   return [...topics].slice(0, 10).map((topic) => {
     const weak = data.weakTopics.find((item) => item.subjectId === subject.id && item.topic.toLowerCase() === topic.toLowerCase());
+    const mastery = data.topicMastery.find((item) => item.subjectId === subject.id && item.topic.toLowerCase() === topic.toLowerCase());
     const correct = data.practiceQuestions.filter((item) => item.subjectId === subject.id && item.topic === topic && item.result === 'correct').length;
     const cards = data.flashcards.filter((item) => item.subjectId === subject.id && item.topic === topic && item.lastReviewed).length;
-    const score = Math.max(10, Math.min(95, 45 + correct * 12 + cards * 5 - (weak?.score ?? 0) * 7 + subject.confidence * 5));
+    const score = mastery?.aiEstimatedMastery ?? Math.max(10, Math.min(95, 45 + correct * 12 + cards * 5 - (weak?.score ?? 0) * 7 + subject.confidence * 5));
     return {
       topic,
       score,
       level: score > 75 ? 'secure' : score > 50 ? 'developing' : 'fragile',
-      reason: weak ? `Weak-topic score ${weak.score}` : `${correct} correct practice answers · ${cards} reviewed cards`,
+      reason: mastery
+        ? `${mastery.revisionCount} revisions · quiz ${mastery.quizCorrect}/${mastery.quizAttempts} · cards ${mastery.flashcardGood}/${mastery.flashcardReviews}`
+        : weak ? `Weak-topic score ${weak.score}` : `${correct} correct practice answers · ${cards} reviewed cards`,
     };
   });
 }
@@ -1716,6 +2140,105 @@ function subjectById(data: ExamPilotData, id?: string) {
 
 function subjectName(data: ExamPilotData, id?: string) {
   return subjectById(data, id)?.name ?? 'No subject';
+}
+
+function extractTopicsFromText(text: string) {
+  const stop = new Set(['revision', 'question', 'questions', 'answer', 'answers', 'explain', 'describe', 'teacher', 'specification', 'method', 'example']);
+  const words = text
+    .replace(/[^\w\s-]/g, ' ')
+    .split(/\s+/)
+    .map((word) => word.trim())
+    .filter((word) => word.length > 4 && !stop.has(word.toLowerCase()));
+  const counts = new Map<string, number>();
+  words.forEach((word) => {
+    const clean = word[0].toUpperCase() + word.slice(1).toLowerCase();
+    counts.set(clean, (counts.get(clean) ?? 0) + 1);
+  });
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([word]) => word).slice(0, 10);
+}
+
+function upsertTopicMastery(
+  items: TopicMastery[],
+  subjectId: string,
+  topic: string,
+  patch: {
+    confidence?: ConfidenceLevel;
+    revisionCountDelta?: number;
+    quizAttemptsDelta?: number;
+    quizCorrectDelta?: number;
+    flashcardReviewsDelta?: number;
+    flashcardGoodDelta?: number;
+    aiEstimatedMastery?: number;
+  },
+) {
+  const existing = items.find((item) => item.subjectId === subjectId && item.topic.toLowerCase() === topic.toLowerCase());
+  const next = (item: TopicMastery): TopicMastery => {
+    const revisionCount = item.revisionCount + (patch.revisionCountDelta ?? 0);
+    const quizAttempts = item.quizAttempts + (patch.quizAttemptsDelta ?? 0);
+    const quizCorrect = item.quizCorrect + (patch.quizCorrectDelta ?? 0);
+    const flashcardReviews = item.flashcardReviews + (patch.flashcardReviewsDelta ?? 0);
+    const flashcardGood = item.flashcardGood + (patch.flashcardGoodDelta ?? 0);
+    const quizAccuracy = quizAttempts ? quizCorrect / quizAttempts : 0.5;
+    const cardAccuracy = flashcardReviews ? flashcardGood / flashcardReviews : 0.5;
+    const estimated = patch.aiEstimatedMastery ?? Math.round((item.confidence / 5) * 35 + quizAccuracy * 35 + cardAccuracy * 20 + Math.min(10, revisionCount * 2));
+    return {
+      ...item,
+      confidence: patch.confidence ?? item.confidence,
+      revisionCount,
+      quizAttempts,
+      quizCorrect,
+      flashcardReviews,
+      flashcardGood,
+      aiEstimatedMastery: Math.max(5, Math.min(98, estimated)),
+      lastRevised: patch.revisionCountDelta ? today() : item.lastRevised,
+      updatedAt: new Date().toISOString(),
+    };
+  };
+
+  if (existing) return items.map((item) => (item.id === existing.id ? next(item) : item));
+  return [
+    ...items,
+    next({
+      id: newId('mastery'),
+      subjectId,
+      topic,
+      confidence: 3,
+      revisionCount: 0,
+      quizAttempts: 0,
+      quizCorrect: 0,
+      flashcardReviews: 0,
+      flashcardGood: 0,
+      aiEstimatedMastery: 45,
+      updatedAt: new Date().toISOString(),
+    }),
+  ];
+}
+
+function inferTopicFromText(text: string, data: ExamPilotData, subjectId: string) {
+  const lower = text.toLowerCase();
+  const known = [
+    ...data.topicMastery.filter((item) => item.subjectId === subjectId).map((item) => item.topic),
+    ...data.weakTopics.filter((item) => item.subjectId === subjectId).map((item) => item.topic),
+    ...data.knowledgeDocuments.filter((item) => item.subjectId === subjectId).flatMap((item) => item.extractedTopics),
+  ];
+  return known.find((topic) => lower.includes(topic.toLowerCase())) ?? extractTopicsFromText(text)[0];
+}
+
+function inferDifficulty(text: string): PastPaperItem['difficulty'] {
+  const lower = text.toLowerCase();
+  if (lower.includes('higher') || lower.includes('evaluate') || lower.includes('assess')) return 'Higher';
+  if (lower.includes('foundation')) return 'Foundation';
+  if (text.length > 700 || lower.includes('essay') || lower.includes('16 mark')) return 'Higher';
+  if (text.length > 250) return 'Standard';
+  return 'Unknown';
+}
+
+function extractBulletishLines(text: string) {
+  return text
+    .split(/\n|\. /)
+    .map((line) => line.replace(/^[-•*\d.)\s]+/, '').trim())
+    .filter((line) => line.length > 18)
+    .slice(0, 10);
 }
 
 export default App;

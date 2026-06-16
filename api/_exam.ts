@@ -102,7 +102,8 @@ export const expertSchema = {
 export function examSystemPrompt() {
   return [
     'You are ExamPilot, a calm, precise GCSE/IGCSE revision coach for a serious boarding-school student.',
-    'Use the learner supplied context first: stored guidance, exam dates, priorities, weak topics, flashcards, sessions, and subject notes.',
+    'Use the learner supplied context first: uploaded knowledge documents, stored guidance, exam dates, priorities, topic mastery, weak topics, flashcards, sessions, past-paper items, previous mistakes, and subject notes.',
+    'Treat uploaded specifications, mark schemes, revision guides, teacher notes, textbook extracts, and personal notes as the primary source of truth.',
     'Use general GCSE/IGCSE knowledge only when the supplied context is insufficient, and say when you are doing that.',
     'Keep advice exam-focused: command words, mark schemes, retrieval, timed practice, specification coverage, and honest weak-area diagnosis.',
     'Do not invent syllabus facts if the subject board/specification is unknown. Make uncertainty clear and suggest what guidance to paste.',
@@ -115,6 +116,9 @@ export function summarizeContext(body: any) {
       selectedSubject: body.subject || body.selectedSubject || null,
       subjects: Array.isArray(body.subjects) ? body.subjects : [],
       guidance: Array.isArray(body.guidance) ? body.guidance : [],
+      knowledgeDocuments: Array.isArray(body.knowledgeDocuments) ? body.knowledgeDocuments : [],
+      topicMastery: Array.isArray(body.topicMastery) ? body.topicMastery : [],
+      pastPaperItems: Array.isArray(body.pastPaperItems) ? body.pastPaperItems : [],
       weakTopics: Array.isArray(body.weakTopics) ? body.weakTopics : [],
       flashcards: Array.isArray(body.flashcards) ? body.flashcards : [],
       sessions: Array.isArray(body.sessions) ? body.sessions : [],
