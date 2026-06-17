@@ -73,4 +73,14 @@ curl -X POST https://your-project.vercel.app/api/analyse-guidance \
 npm run build
 ```
 
+## PDF Extraction Check
+
+PDF uploads use PDF.js with a Vite-bundled worker. To smoke test text extraction locally, run:
+
+```bash
+npm run test:pdf
+```
+
+The test generates two text-based PDFs and verifies that PDF.js extracts expected revision content from both. Scanned or password-protected PDFs should fail gracefully in the app and offer retry or manual paste fallback.
+
 The app uses Vite with `base: './'`, so the production build in `dist/` can be hosted on Vercel, Netlify, static hosting, or GitHub Pages. GitHub Pages cannot run the serverless routes, so set `VITE_AI_API_BASE_URL` to your deployed Vercel backend when using static hosting.

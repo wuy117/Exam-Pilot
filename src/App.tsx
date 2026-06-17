@@ -9,7 +9,9 @@ import {
   CircleDot,
   Clock3,
   Command,
+  Copy,
   Download,
+  Edit3,
   FileText,
   Flame,
   Import,
@@ -24,13 +26,16 @@ import {
   Pause,
   Play,
   Plus,
+  RefreshCw,
   RotateCcw,
+  Save,
   Search,
   Sparkles,
   Target,
   TimerReset,
   Trash2,
   Upload,
+  X,
 } from 'lucide-react';
 import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useState } from 'react';
 import { sampleData } from './data/sampleData';
@@ -57,6 +62,7 @@ import type {
   PracticeQuestion,
   PracticeResult,
   PriorityLevel,
+  RevisionGuidance,
   Subject,
   TimetableMode,
   TimetableSession,
@@ -66,6 +72,7 @@ import type {
 
 type View = 'Dashboard' | 'Subject' | 'Guidance' | 'Timetable' | 'Flashcards' | 'AI' | 'Practice' | 'Papers' | 'Review' | 'Analytics';
 type FlashcardSettings = 'definitions' | 'exam questions' | 'dates' | 'formulas' | 'vocab' | 'essay evidence';
+type DocumentDraft = Pick<KnowledgeDocument, 'sourceName' | 'subjectId' | 'type' | 'text'>;
 
 const today = () => new Date().toISOString().slice(0, 10);
 const newId = (prefix: string) => `${prefix}-${crypto.randomUUID()}`;
@@ -691,8 +698,20 @@ function GuidancePanel({ data, subject, updateData, onWeakTopic }: { data: ExamP
   const [content, setContent] = useState('');
   const [documentType, setDocumentType] = useState<KnowledgeDocumentType>('teacher-note');
   const [extractionProgress, setExtractionProgress] = useState(0);
+  const [documentSearch, setDocumentSearch] = useState('');
+  const [selectedDocuments, setSelectedDocuments] = useState<Set<string>>(new Set());
+  const [editingDocumentId, setEditingDocumentId] = useState<string | null>(null);
+  const [documentDraft, setDocumentDraft] = useState<DocumentDraft | null>(null);
+  const [analysingDocumentId, setAnalysingDocumentId] = useState<string | null>(null);
+  const [undoDocument, setUndoDocument] = useState<KnowledgeDocument | null>(null);
   const subjectGuidance = data.guidance.filter((item) => item.subjectId === subject.id);
   const documents = data.knowledgeDocuments.filter((item) => item.subjectId === subject.id);
+  const visibleDocuments = documents.filter((item) => {
+    const query = documentSearch.trim().toLowerCase();
+    if (!query) return true;
+    return [item.sourceName, item.type, item.status, item.text, ...item.extractedTopics].join(' ').toLowerCase().includes(query);
+  });
+  const selectedVisibleDocs = visibleDocuments.filter((item) => selectedDocuments.has(item.id));
 
   const addGuidance = (event: FormEvent) => {
     event.preventDefault();
@@ -724,47 +743,59 @@ function GuidancePanel({ data, subject, updateData, onWeakTopic }: { data: ExamP
     setContent('');
   };
 
+  const ingestPdf = async (file: File, documentId?: string) => {
+    const docId = documentId ?? newId('doc');
+    setExtractionProgress(1);
+    updateData((current) => {
+      const existing = current.knowledgeDocuments.find((doc) => doc.id === docId);
+      const extractingDoc: KnowledgeDocument = existing
+        ? { ...existing, status: 'extracting', error: undefined, updatedAt: new Date().toISOString() }
+        : {
+            id: docId,
+            subjectId: subject.id,
+            sourceName: file.name,
+            type: 'pdf',
+            status: 'extracting',
+            uploadedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            text: '',
+            extractedTopics: [],
+          };
+      return {
+        ...current,
+        knowledgeDocuments: existing
+          ? current.knowledgeDocuments.map((doc) => (doc.id === docId ? extractingDoc : doc))
+          : [extractingDoc, ...current.knowledgeDocuments],
+      };
+    });
+
+    const result = await extractPdfText(file, setExtractionProgress);
+    const topics = extractTopicsFromText(result.text);
+    updateData((current) => {
+      const previous = current.knowledgeDocuments.find((doc) => doc.id === docId);
+      if (!previous) return current;
+      const nextDoc: KnowledgeDocument = {
+        ...previous,
+        status: result.status,
+        text: result.text,
+        extractedTopics: topics,
+        error: result.error,
+        updatedAt: new Date().toISOString(),
+      };
+      return {
+        ...current,
+        knowledgeDocuments: current.knowledgeDocuments.map((doc) => (doc.id === docId ? nextDoc : doc)),
+        guidance: syncGuidanceForDocument(current.guidance, nextDoc, previous),
+      };
+    });
+    setExtractionProgress(0);
+  };
+
   const uploadPdf = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = '';
     if (!file) return;
-    const docId = newId('doc');
-    setExtractionProgress(1);
-    updateData((current) => ({
-      ...current,
-      knowledgeDocuments: [
-        {
-          id: docId,
-          subjectId: subject.id,
-          sourceName: file.name,
-          type: 'pdf',
-          status: 'extracting',
-          uploadedAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          text: '',
-          extractedTopics: [],
-        },
-        ...current.knowledgeDocuments,
-      ],
-    }));
-
-    const result = await extractPdfText(file, setExtractionProgress);
-    const topics = extractTopicsFromText(result.text);
-    updateData((current) => ({
-      ...current,
-      knowledgeDocuments: current.knowledgeDocuments.map((doc) =>
-        doc.id === docId
-          ? { ...doc, status: result.status, text: result.text, extractedTopics: topics, error: result.error, updatedAt: new Date().toISOString() }
-          : doc,
-      ),
-      guidance: result.status === 'ready'
-        ? [
-            { id: newId('guidance'), subjectId: subject.id, title: file.name, content: result.text, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
-            ...current.guidance,
-          ]
-        : current.guidance,
-    }));
-    setExtractionProgress(0);
+    await ingestPdf(file);
   };
 
   const analyse = async (guidanceId: string, guidanceContent: string) => {
@@ -777,11 +808,124 @@ function GuidancePanel({ data, subject, updateData, onWeakTopic }: { data: ExamP
   };
 
   const deleteDocument = (document: KnowledgeDocument) => {
+    if (!window.confirm(`Delete "${document.sourceName}" from the knowledge base?`)) return;
+    setUndoDocument(document);
     updateData((current) => ({
       ...current,
       knowledgeDocuments: current.knowledgeDocuments.filter((item) => item.id !== document.id),
       guidance: current.guidance.filter((item) => !(item.subjectId === document.subjectId && item.title === document.sourceName && item.content === document.text)),
     }));
+  };
+
+  const restoreDeletedDocument = () => {
+    if (!undoDocument) return;
+    updateData((current) => ({
+      ...current,
+      knowledgeDocuments: [undoDocument, ...current.knowledgeDocuments],
+      guidance: syncGuidanceForDocument(current.guidance, undoDocument),
+    }));
+    setUndoDocument(null);
+  };
+
+  const startEditingDocument = (document: KnowledgeDocument) => {
+    setEditingDocumentId(document.id);
+    setDocumentDraft({
+      sourceName: document.sourceName,
+      subjectId: document.subjectId,
+      type: document.type,
+      text: document.text,
+    });
+  };
+
+  const cancelEditingDocument = () => {
+    setEditingDocumentId(null);
+    setDocumentDraft(null);
+  };
+
+  const saveDocumentDraft = (document: KnowledgeDocument) => {
+    if (!documentDraft || !documentDraft.sourceName.trim()) return;
+    const nextDoc: KnowledgeDocument = {
+      ...document,
+      ...documentDraft,
+      sourceName: documentDraft.sourceName.trim(),
+      text: documentDraft.text.trim(),
+      status: documentDraft.text.trim() ? 'ready' : 'failed',
+      extractedTopics: extractTopicsFromText(documentDraft.text),
+      error: documentDraft.text.trim() ? undefined : 'No text is saved for this source yet. Paste extracted text manually or retry the PDF upload.',
+      updatedAt: new Date().toISOString(),
+    };
+    updateData((current) => ({
+      ...current,
+      knowledgeDocuments: current.knowledgeDocuments.map((item) => (item.id === document.id ? nextDoc : item)),
+      guidance: syncGuidanceForDocument(current.guidance, nextDoc, document),
+    }));
+    cancelEditingDocument();
+  };
+
+  const duplicateDocument = (document: KnowledgeDocument) => {
+    const copy: KnowledgeDocument = {
+      ...document,
+      id: newId('doc'),
+      sourceName: `${document.sourceName} copy`,
+      uploadedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    updateData((current) => ({
+      ...current,
+      knowledgeDocuments: [copy, ...current.knowledgeDocuments],
+      guidance: syncGuidanceForDocument(current.guidance, copy),
+    }));
+  };
+
+  const mergeSelectedDocuments = () => {
+    if (selectedVisibleDocs.length < 2) return;
+    const mergedText = selectedVisibleDocs.map((doc) => `# ${doc.sourceName}\n${doc.text}`).join('\n\n');
+    const merged: KnowledgeDocument = {
+      id: newId('doc'),
+      subjectId: subject.id,
+      sourceName: `${subject.name} merged source (${selectedVisibleDocs.length})`,
+      type: 'note',
+      status: mergedText.trim() ? 'ready' : 'failed',
+      uploadedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      text: mergedText,
+      extractedTopics: extractTopicsFromText(mergedText),
+      error: mergedText.trim() ? undefined : 'Selected documents did not contain text to merge.',
+    };
+    updateData((current) => ({
+      ...current,
+      knowledgeDocuments: [merged, ...current.knowledgeDocuments],
+      guidance: syncGuidanceForDocument(current.guidance, merged),
+    }));
+    setSelectedDocuments(new Set());
+  };
+
+  const regenerateDocumentAnalysis = async (document: KnowledgeDocument) => {
+    if (!document.text.trim()) return;
+    setAnalysingDocumentId(document.id);
+    const targetSubject = subjectById(data, document.subjectId) ?? subject;
+    const analysis = await analyseGuidance(targetSubject, document.text, data);
+    if (document.subjectId === subject.id) analysis.likelyWeakAreas.forEach(onWeakTopic);
+    const topics = [...new Set([...analysis.keyTopics, ...analysis.subtopics, ...extractTopicsFromText(document.text)])].slice(0, 12);
+    updateData((current) => {
+      const latest = current.knowledgeDocuments.find((item) => item.id === document.id) ?? document;
+      const nextDoc = { ...latest, extractedTopics: topics, updatedAt: new Date().toISOString(), error: undefined };
+      return {
+        ...current,
+        knowledgeDocuments: current.knowledgeDocuments.map((item) => (item.id === document.id ? nextDoc : item)),
+        guidance: upsertGuidanceAnalysis(syncGuidanceForDocument(current.guidance, nextDoc, latest), nextDoc, analysis),
+      };
+    });
+    setAnalysingDocumentId(null);
+  };
+
+  const toggleSelectedDocument = (id: string) => {
+    setSelectedDocuments((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   };
 
   return (
@@ -803,27 +947,84 @@ function GuidancePanel({ data, subject, updateData, onWeakTopic }: { data: ExamP
             </label>
             {extractionProgress > 0 && <span className="ai-pill"><Loader2 size={13} className="animate-spin" /> Extracting {extractionProgress}%</span>}
           </div>
+          <p className="text-xs leading-5 text-stone-500">Workflow: add a subject, add guidance, analyse it, then generate cards, quizzes, questions, and revision sessions from the extracted topics.</p>
         </form>
 
         <section className="rounded-lg border border-stone-200 bg-white p-4">
-          <SectionTitle icon={<Library size={17} />} title="Documents" />
+          <div className="section-line">
+            <SectionTitle icon={<Library size={17} />} title="Documents" />
+            <div className="flex flex-wrap gap-2">
+              <input className="input h-9 w-52" value={documentSearch} onChange={(event) => setDocumentSearch(event.target.value)} placeholder="Search uploaded content" />
+              <button className="btn-secondary" disabled={selectedVisibleDocs.length < 2} onClick={mergeSelectedDocuments}><Layers3 size={15} /> Merge</button>
+            </div>
+          </div>
+          {undoDocument && (
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+              <span>Deleted {undoDocument.sourceName}.</span>
+              <button className="tiny-button" onClick={restoreDeletedDocument}>Undo</button>
+            </div>
+          )}
           <div className="mt-4 space-y-2">
-            {documents.length ? documents.map((doc) => (
+            {visibleDocuments.length ? visibleDocuments.map((doc) => (
               <div key={doc.id} className="document-row">
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h3>{doc.sourceName}</h3>
-                    <span className={`pill status-${doc.status === 'ready' ? 'done' : doc.status === 'failed' ? 'skipped' : 'planned'}`}>{doc.status}</span>
+                {editingDocumentId === doc.id && documentDraft ? (
+                  <div className="w-full space-y-3">
+                    <div className="grid gap-2 sm:grid-cols-[1fr_160px]">
+                      <input className="input" value={documentDraft.sourceName} onChange={(event) => setDocumentDraft({ ...documentDraft, sourceName: event.target.value })} />
+                      <select className="input" value={documentDraft.type} onChange={(event) => setDocumentDraft({ ...documentDraft, type: event.target.value as KnowledgeDocumentType })}>
+                        {['pdf', 'teacher-note', 'specification', 'mark-scheme', 'textbook', 'note', 'revision-guide'].map((item) => <option key={item} value={item}>{item}</option>)}
+                      </select>
+                    </div>
+                    <select className="input" value={documentDraft.subjectId} onChange={(event) => setDocumentDraft({ ...documentDraft, subjectId: event.target.value })}>
+                      {data.subjects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                    </select>
+                    <textarea className="input min-h-40" value={documentDraft.text} onChange={(event) => setDocumentDraft({ ...documentDraft, text: event.target.value })} placeholder="Paste extracted text here if the PDF was scanned, locked, or unsupported." />
+                    <div className="flex flex-wrap justify-end gap-2">
+                      <button className="btn-secondary" onClick={cancelEditingDocument} type="button"><X size={15} /> Cancel</button>
+                      <button className="btn-primary" onClick={() => saveDocumentDraft(doc)} type="button"><Save size={15} /> Save source</button>
+                    </div>
                   </div>
-                  <p>{doc.type} · uploaded {doc.uploadedAt.slice(0, 10)} · {doc.text.length.toLocaleString()} chars</p>
-                  {doc.error && <p className="text-rose-700">{doc.error}</p>}
-                  <div className="mt-2 flex flex-wrap gap-1">
-                    {doc.extractedTopics.slice(0, 6).map((topic) => <span key={topic} className="pill">{topic}</span>)}
-                  </div>
-                </div>
-                <button className="icon-button" title="Delete document" onClick={() => deleteDocument(doc)}><Trash2 size={15} /></button>
+                ) : (
+                  <>
+                    <label className="mt-1 flex items-start">
+                      <input className="h-4 w-4 accent-stone-950" type="checkbox" checked={selectedDocuments.has(doc.id)} onChange={() => toggleSelectedDocument(doc.id)} aria-label={`Select ${doc.sourceName}`} />
+                    </label>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3>{doc.sourceName}</h3>
+                        <span className={`pill status-${doc.status === 'ready' ? 'done' : doc.status === 'failed' ? 'skipped' : 'planned'}`}>{doc.status}</span>
+                        {analysingDocumentId === doc.id && <span className="ai-pill"><Loader2 size={13} className="animate-spin" /> analysing</span>}
+                      </div>
+                      <p>{doc.type} · uploaded {doc.uploadedAt.slice(0, 10)} · updated {doc.updatedAt.slice(0, 10)} · {doc.text.length.toLocaleString()} chars</p>
+                      {doc.error && (
+                        <div className="mt-2 rounded-md border border-rose-200 bg-rose-50 p-2 text-xs leading-5 text-rose-800">
+                          {doc.error}
+                          <span className="block text-rose-700">Retry with another PDF, delete the source, or edit it and paste extracted text manually.</span>
+                        </div>
+                      )}
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {doc.extractedTopics.length ? doc.extractedTopics.slice(0, 6).map((topic) => <span key={topic} className="pill">{topic}</span>) : <span className="pill">no topics yet</span>}
+                      </div>
+                      {doc.status === 'extracting' && <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-stone-200"><div className="h-full rounded-full bg-stone-950 transition-all" style={{ width: `${Math.max(10, extractionProgress)}%` }} /></div>}
+                    </div>
+                    <div className="document-actions">
+                      {doc.status === 'failed' && (
+                        <label className="icon-button" title="Retry PDF upload">
+                          <RefreshCw size={15} />
+                          <input className="hidden" type="file" accept="application/pdf" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void ingestPdf(file, doc.id); }} />
+                        </label>
+                      )}
+                      <button className="icon-button" title="Regenerate AI analysis" disabled={!doc.text.trim() || analysingDocumentId === doc.id} onClick={() => void regenerateDocumentAnalysis(doc)}><Sparkles size={15} /></button>
+                      <button className="icon-button" title="Edit document" onClick={() => startEditingDocument(doc)}><Edit3 size={15} /></button>
+                      <button className="icon-button" title="Duplicate document" onClick={() => duplicateDocument(doc)}><Copy size={15} /></button>
+                      <button className="icon-button" title="Delete document" onClick={() => deleteDocument(doc)}><Trash2 size={15} /></button>
+                    </div>
+                  </>
+                )}
               </div>
-            )) : <EmptyState title="No documents yet" body="Upload a PDF or paste source material to build the subject knowledge base." compact />}
+            )) : documents.length ? (
+              <EmptyState title="No matching documents" body="Clear the search to see all uploaded sources for this subject." compact />
+            ) : <EmptyState title="No documents yet" body="Upload a PDF or paste source material to build the subject knowledge base. Failed PDFs can be retried or completed by manual paste." compact />}
           </div>
         </section>
       </div>
@@ -833,10 +1034,13 @@ function GuidancePanel({ data, subject, updateData, onWeakTopic }: { data: ExamP
           <article key={item.id} className="document-card">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
               <div>
-                <h3>{item.title}</h3>
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3>{item.title}</h3>
+                  {item.analysis && <span className="pill">AI analysed</span>}
+                </div>
                 <p>{item.content}</p>
               </div>
-              <button className="btn-secondary shrink-0" onClick={() => analyse(item.id, item.content)}><Sparkles size={16} /> Analyse with AI</button>
+              <button className="btn-secondary shrink-0" onClick={() => analyse(item.id, item.content)}><Sparkles size={16} /> {item.analysis ? 'Regenerate analysis' : 'Analyse with AI'}</button>
             </div>
             {item.analysis && <AnalysisGrid analysis={item.analysis} />}
           </article>
@@ -965,7 +1169,11 @@ function TimetablePanel({ data, updateData, mode, setMode }: { data: ExamPilotDa
   const updateSession = (id: string, patch: Partial<TimetableSession>) =>
     updateData((current) => ({ ...current, sessions: current.sessions.map((session) => (session.id === id ? { ...session, ...patch } : session)) }));
 
-  const deleteSession = (id: string) => updateData((current) => ({ ...current, sessions: current.sessions.filter((session) => session.id !== id) }));
+  const deleteSession = (id: string) => {
+    const session = data.sessions.find((item) => item.id === id);
+    if (session && !window.confirm(`Delete "${session.title}" from the timetable?`)) return;
+    updateData((current) => ({ ...current, sessions: current.sessions.filter((item) => item.id !== id) }));
+  };
 
   const markSkipped = (session: TimetableSession) => {
     const date = new Date(`${session.date}T12:00:00`);
@@ -1062,6 +1270,8 @@ function FlashcardPanel({ data, activeSubject, updateData, onWeakTopic }: { data
   const [topicFilter, setTopicFilter] = useState('');
   const [settings, setSettings] = useState<FlashcardSettings>('definitions');
   const [cardSupport, setCardSupport] = useState('');
+  const [generatedDraft, setGeneratedDraft] = useState<Flashcard[]>([]);
+  const [generatingCards, setGeneratingCards] = useState(false);
 
   const scopedCards = data.flashcards
     .filter((card) => !activeSubject || card.subjectId === activeSubject.id)
@@ -1095,12 +1305,24 @@ function FlashcardPanel({ data, activeSubject, updateData, onWeakTopic }: { data
 
   const generate = async () => {
     if (!activeSubject) return;
+    setGeneratingCards(true);
     const guidance = [
       `Generate ${settings} flashcards.`,
       ...data.guidance.filter((item) => item.subjectId === activeSubject.id).map((item) => item.content),
     ].join('\n');
     const cards = await generateFlashcards(activeSubject, guidance, data);
-    updateData((current) => ({ ...current, flashcards: [...cards, ...current.flashcards] }));
+    setGeneratedDraft(cards);
+    setGeneratingCards(false);
+  };
+
+  const saveGeneratedDraft = () => {
+    if (!generatedDraft.length) return;
+    updateData((current) => ({ ...current, flashcards: [...generatedDraft, ...current.flashcards] }));
+    setGeneratedDraft([]);
+  };
+
+  const updateGeneratedDraft = (id: string, patch: Partial<Flashcard>) => {
+    setGeneratedDraft((current) => current.map((card) => (card.id === id ? { ...card, ...patch } : card)));
   };
 
   const review = (card: Flashcard, difficulty: FlashcardDifficulty) => {
@@ -1145,7 +1367,7 @@ function FlashcardPanel({ data, activeSubject, updateData, onWeakTopic }: { data
         eyebrow="Flashcards"
         title="Review queue"
         subtitle="Due filters, topic targeting, keyboard shortcuts, and AI card-generation modes."
-        action={<button className="btn-primary" onClick={generate}><Sparkles size={16} /> Generate {settings}</button>}
+        action={<button className="btn-primary" onClick={generate} disabled={generatingCards || !activeSubject}>{generatingCards ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />} Generate {settings}</button>}
       />
 
       <div className="grid gap-4 xl:grid-cols-[1fr_0.9fr]">
@@ -1192,6 +1414,37 @@ function FlashcardPanel({ data, activeSubject, updateData, onWeakTopic }: { data
           </form>
         </section>
       </div>
+
+      {generatedDraft.length ? (
+        <section className="panel">
+          <div className="section-line">
+            <div>
+              <SectionTitle icon={<Sparkles size={17} />} title="AI-generated draft cards" />
+              <p className="muted mt-1">Review and edit these before saving them to the active subject.</p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button className="btn-secondary" onClick={generate} disabled={generatingCards}>{generatingCards ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />} Regenerate</button>
+              <button className="btn-secondary" onClick={() => setGeneratedDraft([])}><X size={15} /> Discard</button>
+              <button className="btn-primary" onClick={saveGeneratedDraft}><Save size={15} /> Save {generatedDraft.length}</button>
+            </div>
+          </div>
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
+            {generatedDraft.map((card) => (
+              <div key={card.id} className="draft-card">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="pill">AI draft</span>
+                  <input className="input h-9 flex-1" value={card.topic} onChange={(event) => updateGeneratedDraft(card.id, { topic: event.target.value })} placeholder="Topic" />
+                </div>
+                <input className="input" value={card.question} onChange={(event) => updateGeneratedDraft(card.id, { question: event.target.value })} placeholder="Question" />
+                <textarea className="input min-h-20" value={card.answer} onChange={(event) => updateGeneratedDraft(card.id, { answer: event.target.value })} placeholder="Answer" />
+                <select className="input" value={card.difficulty} onChange={(event) => updateGeneratedDraft(card.id, { difficulty: event.target.value as FlashcardDifficulty })}>
+                  {(['Again', 'Hard', 'Good', 'Easy'] as FlashcardDifficulty[]).map((item) => <option key={item}>{item}</option>)}
+                </select>
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       <section className="panel">
         <div className="section-line">
@@ -1420,44 +1673,53 @@ function PastPaperPanel({ data, subject, updateData, onWeakTopic }: { data: Exam
   const [questionText, setQuestionText] = useState('');
   const [topicHint, setTopicHint] = useState('');
   const [loading, setLoading] = useState(false);
+  const [draftItem, setDraftItem] = useState<PastPaperItem | null>(null);
   const items = data.pastPaperItems.filter((item) => item.subjectId === subject.id);
 
   const analyseQuestion = async (event: FormEvent) => {
     event.preventDefault();
     if (!questionText.trim()) return;
     setLoading(true);
-    const prompt = [
-      `Analyse this past-paper question for ${subject.name}.`,
-      'Identify the topic, estimate difficulty, give a model answer, mark-scheme bullet points, and follow-up revision.',
-      'Use uploaded knowledge-base documents first, then general GCSE/IGCSE knowledge only if needed.',
-      topicHint ? `Topic hint: ${topicHint}` : '',
-      `Question:\n${questionText}`,
-    ].filter(Boolean).join('\n\n');
-    const answer = await askExamExpert(prompt, subject, data);
-    const topic = topicHint || inferTopicFromText(questionText, data, subject.id) || 'AI identified topic';
-    const markSchemePoints = extractBulletishLines(answer).slice(0, 8);
-    const item: PastPaperItem = {
-      id: newId('paper'),
-      subjectId: subject.id,
-      sourceName: sourceName || 'Pasted exam question',
-      questionText,
-      topic,
-      difficulty: inferDifficulty(questionText),
-      modelAnswer: answer,
-      markSchemePoints: markSchemePoints.length ? markSchemePoints : ['Check answer against the official mark scheme.', 'Convert missing marks into flashcards.'],
-      followUpRevision: [`Revise ${topic}`, 'Attempt a similar timed question', 'Log any missing mark-scheme points'],
-      createdAt: new Date().toISOString(),
-    };
+    try {
+      const prompt = [
+        `Analyse this past-paper question for ${subject.name}.`,
+        'Identify the topic, estimate difficulty, give a model answer, mark-scheme bullet points, and follow-up revision.',
+        'Use uploaded knowledge-base documents first, then general GCSE/IGCSE knowledge only if needed.',
+        topicHint ? `Topic hint: ${topicHint}` : '',
+        `Question:\n${questionText}`,
+      ].filter(Boolean).join('\n\n');
+      const answer = await askExamExpert(prompt, subject, data);
+      const topic = topicHint || inferTopicFromText(questionText, data, subject.id) || 'AI identified topic';
+      const markSchemePoints = extractBulletishLines(answer).slice(0, 8);
+      setDraftItem({
+        id: newId('paper'),
+        subjectId: subject.id,
+        sourceName: sourceName || 'Pasted exam question',
+        questionText,
+        topic,
+        difficulty: inferDifficulty(questionText),
+        modelAnswer: answer,
+        markSchemePoints: markSchemePoints.length ? markSchemePoints : ['Check answer against the official mark scheme.', 'Convert missing marks into flashcards.'],
+        followUpRevision: [`Revise ${topic}`, 'Attempt a similar timed question', 'Log any missing mark-scheme points'],
+        createdAt: new Date().toISOString(),
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const saveDraftQuestion = () => {
+    if (!draftItem) return;
     updateData((current) => ({
       ...current,
-      pastPaperItems: [item, ...current.pastPaperItems],
-      topicMastery: upsertTopicMastery(current.topicMastery, subject.id, topic, { quizAttemptsDelta: 1 }),
+      pastPaperItems: [draftItem, ...current.pastPaperItems],
+      topicMastery: upsertTopicMastery(current.topicMastery, subject.id, draftItem.topic, { quizAttemptsDelta: 1 }),
     }));
-    onWeakTopic(subject.id, topic, 'past paper assistant', 1);
+    onWeakTopic(subject.id, draftItem.topic, 'past paper assistant', 1);
     setQuestionText('');
     setTopicHint('');
     setSourceName('');
-    setLoading(false);
+    setDraftItem(null);
   };
 
   return (
@@ -1477,6 +1739,27 @@ function PastPaperPanel({ data, subject, updateData, onWeakTopic }: { data: Exam
           <button className="btn-primary" disabled={loading}>{loading ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />} Analyse question</button>
         </form>
       </section>
+      {draftItem && (
+        <section className="panel">
+          <div className="section-line">
+            <div>
+              <SectionTitle icon={<Sparkles size={17} />} title="AI analysis draft" />
+              <p className="muted mt-1">Edit the model answer, topic, and mark-scheme points before saving.</p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button className="btn-secondary" onClick={() => setDraftItem(null)}><X size={15} /> Discard</button>
+              <button className="btn-primary" onClick={saveDraftQuestion}><Save size={15} /> Save to subject</button>
+            </div>
+          </div>
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
+            <input className="input" value={draftItem.sourceName} onChange={(event) => setDraftItem({ ...draftItem, sourceName: event.target.value })} />
+            <input className="input" value={draftItem.topic} onChange={(event) => setDraftItem({ ...draftItem, topic: event.target.value })} />
+          </div>
+          <textarea className="input mt-3 min-h-32" value={draftItem.modelAnswer ?? ''} onChange={(event) => setDraftItem({ ...draftItem, modelAnswer: event.target.value })} />
+          <textarea className="input mt-3 min-h-24" value={draftItem.markSchemePoints.join('\n')} onChange={(event) => setDraftItem({ ...draftItem, markSchemePoints: event.target.value.split('\n').map((item) => item.trim()).filter(Boolean) })} placeholder="One mark-scheme point per line" />
+          <textarea className="input mt-3 min-h-20" value={draftItem.followUpRevision.join('\n')} onChange={(event) => setDraftItem({ ...draftItem, followUpRevision: event.target.value.split('\n').map((item) => item.trim()).filter(Boolean) })} placeholder="One follow-up task per line" />
+        </section>
+      )}
       <section className="panel">
         <SectionTitle icon={<Library size={17} />} title="Analysed questions" />
         <div className="mt-4 grid gap-3 xl:grid-cols-2">
@@ -2132,6 +2415,54 @@ function formatTimer(seconds: number) {
   const mins = Math.floor(seconds / 60).toString().padStart(2, '0');
   const secs = (seconds % 60).toString().padStart(2, '0');
   return `${mins}:${secs}`;
+}
+
+function syncGuidanceForDocument(guidance: RevisionGuidance[], document: KnowledgeDocument, previous?: KnowledgeDocument) {
+  const previousMatches = (item: RevisionGuidance) =>
+    previous
+      ? item.subjectId === previous.subjectId && item.title === previous.sourceName && item.content === previous.text
+      : false;
+  const currentMatches = (item: RevisionGuidance) =>
+    item.subjectId === document.subjectId && item.title === document.sourceName && item.content === document.text;
+  const cleaned = guidance.filter((item) => !previousMatches(item) && !currentMatches(item));
+
+  if (document.status !== 'ready' || !document.text.trim()) return cleaned;
+
+  const existing = guidance.find((item) => previousMatches(item) || currentMatches(item));
+  return [
+    {
+      id: existing?.id ?? newId('guidance'),
+      subjectId: document.subjectId,
+      title: document.sourceName,
+      content: document.text,
+      createdAt: existing?.createdAt ?? document.uploadedAt,
+      updatedAt: new Date().toISOString(),
+      analysis: existing?.analysis,
+    },
+    ...cleaned,
+  ];
+}
+
+function upsertGuidanceAnalysis(guidance: RevisionGuidance[], document: KnowledgeDocument, analysis: RevisionGuidance['analysis']) {
+  const existing = guidance.find((item) => item.subjectId === document.subjectId && item.title === document.sourceName && item.content === document.text);
+  if (existing) {
+    return guidance.map((item) =>
+      item.id === existing.id ? { ...item, analysis, updatedAt: new Date().toISOString() } : item,
+    );
+  }
+  if (document.status !== 'ready' || !document.text.trim()) return guidance;
+  return [
+    {
+      id: newId('guidance'),
+      subjectId: document.subjectId,
+      title: document.sourceName,
+      content: document.text,
+      createdAt: document.uploadedAt,
+      updatedAt: new Date().toISOString(),
+      analysis,
+    },
+    ...guidance,
+  ];
 }
 
 function subjectById(data: ExamPilotData, id?: string) {
